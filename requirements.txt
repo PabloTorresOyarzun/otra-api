@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+requests
+httpx
+python-dotenv
+pydantic
+pydantic-settings
+python-multipart
+PyMuPDF
+opencv-python
+numpy
+pandas
+openpyxl
+xlrd
+reportlab
+tenacity

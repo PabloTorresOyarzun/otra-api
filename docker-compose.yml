@@ -1,0 +1,58 @@
+services:
+  azure-di-layout:
+    image: mcr.microsoft.com/azure-cognitive-services/form-recognizer/layout-4.0:latest
+    container_name: azure-di-layout
+    environment:
+      Eula: "accept"
+      Billing: ${AZURE_ENDPOINT}
+      ApiKey: ${AZURE_KEY}
+      Logging__Console__LogLevel__Default: "Information"
+      SharedRootFolder: "/shared"
+      Mounts__Shared: "/shared"
+      Mounts__Output: "/logs"
+    volumes:
+      - ./shared:/shared
+      - ./logs:/logs
+    expose:
+      - "5000"
+    networks:
+      - api-network
+
+  azure-di-custom:
+    image: mcr.microsoft.com/azure-cognitive-services/form-recognizer/custom-template-3.1:latest
+    container_name: azure-di-custom
+    environment:
+      Eula: "accept"
+      Billing: ${AZURE_ENDPOINT}
+      ApiKey: ${AZURE_KEY}
+      AzureCognitiveServiceLayoutHost: "http://azure-di-layout:5000"
+      SharedRootFolder: "/shared"
+      Mounts__Shared: "/shared"
+      Mounts__Output: "/logs"
+    volumes:
+      - ./shared:/shared
+      - ./logs:/logs
+    expose:
+      - "5000"
+    depends_on:
+      - azure-di-layout
+    networks:
+      - api-network
+
+  sgd-api:
+    build: .
+    container_name: sgd-api
+    ports:
+      - "8080:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - azure-di-layout
+      - azure-di-custom
+    networks:
+      - api-network
+
+networks:
+  api-network:
+    driver: bridge
