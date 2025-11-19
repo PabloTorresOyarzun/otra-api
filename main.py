@@ -22,6 +22,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from quality import paso_1_analizar_documento, paso_2_corregir_rotacion
 from clasificacion import clasificar_documento_completo, segmentar_pdf
 from config import get_settings, calcular_timeout_excel, get_valid_api_tokens
+from token_manager import token_manager
 
 
 @contextmanager
@@ -50,18 +51,40 @@ def verify_api_token(credentials: HTTPAuthorizationCredentials = Security(securi
     - Header: Authorization
     - Value: Bearer <tu-token-aqui>
     """
-    valid_tokens = get_valid_api_tokens()
+    # Verificar desde el gestor de tokens (modo persistente)
+    if token_manager.is_valid_token(credentials.credentials):
+        return credentials.credentials
 
-    if not valid_tokens:
+    # Fallback: verificar desde API_TOKENS en .env (modo legacy)
+    valid_tokens = get_valid_api_tokens()
+    if valid_tokens and credentials.credentials in valid_tokens:
+        return credentials.credentials
+
+    raise HTTPException(
+        status_code=401,
+        detail="Token de autenticación inválido"
+    )
+
+
+def verify_admin_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
+    """
+    Verifica que el token de administrador sea válido.
+    Solo permite acceso a endpoints de gestión de tokens.
+
+    Uso en Postman:
+    - Header: Authorization
+    - Value: Bearer <admin-token>
+    """
+    if not settings.ADMIN_TOKEN:
         raise HTTPException(
             status_code=500,
-            detail="API_TOKENS no configurado en el servidor"
+            detail="ADMIN_TOKEN no configurado en el servidor"
         )
 
-    if credentials.credentials not in valid_tokens:
+    if credentials.credentials != settings.ADMIN_TOKEN:
         raise HTTPException(
-            status_code=401,
-            detail="Token de autenticación inválido"
+            status_code=403,
+            detail="Se requiere token de administrador"
         )
 
     return credentials.credentials
@@ -130,9 +153,38 @@ class ProcesamientoIndividualResponse(BaseModel):
     documentos: List[DocumentoFinal]
 
 
+class TokenInfo(BaseModel):
+    id: str
+    name: str
+    masked_token: str
+    created_at: str
+    created_by: str
+    last_used: Optional[str] = None
+    is_active: bool = True
+
+
+class TokenCreateRequest(BaseModel):
+    name: str
+    created_by: str = "admin"
+
+
+class TokenCreateResponse(BaseModel):
+    id: str
+    token: str
+    name: str
+    created_at: str
+    message: str
+
+
+class TokenDeleteResponse(BaseModel):
+    success: bool
+    message: str
+
+
 # Routers
 sgd_router = APIRouter(prefix="/sgd", tags=["SGD"])
 documentos_router = APIRouter(prefix="/documentos", tags=["Documentos"])
+admin_router = APIRouter(prefix="/admin/tokens", tags=["Admin - Gestión de Tokens"])
 
 
 def validar_pdf(file_bytes: bytes) -> bool:
@@ -731,8 +783,79 @@ async def procesar_documento_individual(file: UploadFile = File(...), token: str
         raise HTTPException(status_code=500, detail=f"Error al procesar documento: {str(e)}")
 
 
+# ============================================
+# ADMIN ENDPOINTS - Gestión de Tokens
+# ============================================
+
+@admin_router.get("/", response_model=List[TokenInfo])
+async def listar_tokens(admin_token: str = Depends(verify_admin_token)):
+    """
+    Lista todos los tokens de la API con su metadata.
+
+    **Requiere token de administrador.**
+
+    - Muestra tokens enmascarados por seguridad
+    - Incluye fecha de creación y último uso
+    - Muestra estado activo/inactivo
+    """
+    tokens = token_manager.list_tokens()
+    return tokens
+
+
+@admin_router.post("/generate", response_model=TokenCreateResponse)
+async def generar_token(
+    request: TokenCreateRequest,
+    admin_token: str = Depends(verify_admin_token)
+):
+    """
+    Genera un nuevo token de autenticación API.
+
+    **Requiere token de administrador.**
+
+    - **name**: Nombre descriptivo del token (ej: "Token para Postman", "Token producción")
+    - **created_by**: Quién crea el token (opcional, default: "admin")
+
+    **IMPORTANTE**: El token completo solo se muestra una vez.
+    Guárdalo en un lugar seguro.
+    """
+    result = token_manager.generate_token(
+        name=request.name,
+        created_by=request.created_by
+    )
+    return result
+
+
+@admin_router.delete("/{token_id}", response_model=TokenDeleteResponse)
+async def eliminar_token(
+    token_id: str,
+    admin_token: str = Depends(verify_admin_token)
+):
+    """
+    Elimina un token por su ID.
+
+    **Requiere token de administrador.**
+
+    - **token_id**: ID del token a eliminar (obtenido desde listar_tokens)
+
+    El token eliminado dejará de funcionar inmediatamente.
+    """
+    success = token_manager.delete_token(token_id)
+
+    if success:
+        return TokenDeleteResponse(
+            success=True,
+            message=f"Token {token_id} eliminado exitosamente"
+        )
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Token {token_id} no encontrado"
+        )
+
+
 app.include_router(sgd_router)
 app.include_router(documentos_router)
+app.include_router(admin_router)
 
 
 @app.get("/")

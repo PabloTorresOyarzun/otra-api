@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# API Tokens Database
+tokens.json
+
 # Python
 __pycache__/
 *.py[cod]

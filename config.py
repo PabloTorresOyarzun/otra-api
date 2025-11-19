@@ -10,6 +10,9 @@ class Settings(BaseSettings):
 
     # API Authentication - Tokens permitidos para acceder a la API
     API_TOKENS: str = ""  # Tokens separados por comas
+
+    # Admin Token - Token especial para gestionar el mantenedor de tokens
+    ADMIN_TOKEN: str = ""  # Token de administrador para endpoints de gestión
     
     # HTTP Timeouts
     TIMEOUT_CONNECT: float = 5.0
