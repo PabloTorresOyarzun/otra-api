@@ -51,6 +51,10 @@ def verify_api_token(credentials: HTTPAuthorizationCredentials = Security(securi
     - Header: Authorization
     - Value: Bearer <tu-token-aqui>
     """
+    # Si es el ADMIN_TOKEN, permitir acceso (admin tiene acceso a todo)
+    if settings.ADMIN_TOKEN and credentials.credentials == settings.ADMIN_TOKEN:
+        return credentials.credentials
+
     # Verificar desde el gestor de tokens (modo persistente)
     if token_manager.is_valid_token(credentials.credentials):
         return credentials.credentials
@@ -811,7 +815,7 @@ async def generar_token(
 
     **Requiere token de administrador.**
 
-    - **name**: Nombre descriptivo del token o usuario (ej: "Token para Postman", "Usuario Pablo", "App Móvil")
+    - **name**: Nombre descriptivo del token o usuario
 
     **IMPORTANTE**: El token completo solo se muestra una vez.
     Guárdalo en un lugar seguro.
