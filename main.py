@@ -800,8 +800,27 @@ async def listar_tokens(admin_token: str = Depends(verify_admin_token)):
     - Muestra tokens enmascarados por seguridad
     - Incluye fecha de creación y último uso
     - Muestra estado activo/inactivo
+    - Incluye tokens del gestor (tokens.json) y tokens legacy (.env)
     """
+    # Tokens del gestor (tokens.json)
     tokens = token_manager.list_tokens()
+
+    # Agregar tokens del .env (API_TOKENS)
+    env_tokens = get_valid_api_tokens()
+    for idx, token_value in enumerate(env_tokens, start=1):
+        # Enmascarar token
+        masked_token = f"{token_value[:8]}...{token_value[-4:]}" if len(token_value) > 12 else "***"
+
+        tokens.append({
+            "id": f"env-token-{idx}",
+            "name": f"Token de .env #{idx}",
+            "masked_token": masked_token,
+            "created_at": "N/A",
+            "created_by": "env-config",
+            "last_used": None,
+            "is_active": True
+        })
+
     return tokens
 
 
