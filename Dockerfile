@@ -20,5 +20,6 @@ COPY main.py .
 COPY quality.py .
 COPY patrones.py .
 COPY clasificacion.py .
+COPY token_manager.py .
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
