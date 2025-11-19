@@ -165,7 +165,6 @@ class TokenInfo(BaseModel):
 
 class TokenCreateRequest(BaseModel):
     name: str
-    created_by: str = "admin"
 
 
 class TokenCreateResponse(BaseModel):
@@ -812,15 +811,14 @@ async def generar_token(
 
     **Requiere token de administrador.**
 
-    - **name**: Nombre descriptivo del token (ej: "Token para Postman", "Token producción")
-    - **created_by**: Quién crea el token (opcional, default: "admin")
+    - **name**: Nombre descriptivo del token o usuario (ej: "Token para Postman", "Usuario Pablo", "App Móvil")
 
     **IMPORTANTE**: El token completo solo se muestra una vez.
     Guárdalo en un lugar seguro.
     """
     result = token_manager.generate_token(
         name=request.name,
-        created_by=request.created_by
+        created_by="admin"
     )
     return result
 
