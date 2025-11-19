@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, APIRouter, File, UploadFile
+from fastapi import FastAPI, HTTPException, APIRouter, File, UploadFile, Security, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import httpx
 import os
@@ -20,7 +21,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 
 from quality import paso_1_analizar_documento, paso_2_corregir_rotacion
 from clasificacion import clasificar_documento_completo, segmentar_pdf
-from config import get_settings, calcular_timeout_excel
+from config import get_settings, calcular_timeout_excel, get_valid_api_tokens
 
 
 @contextmanager
@@ -36,6 +37,35 @@ def suprimir_prints():
 
 settings = get_settings()
 app = FastAPI(title="API Docs")
+
+# Esquema de seguridad para autenticación con token
+security = HTTPBearer()
+
+
+def verify_api_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
+    """
+    Verifica que el token API proporcionado sea válido.
+
+    Uso en Postman:
+    - Header: Authorization
+    - Value: Bearer <tu-token-aqui>
+    """
+    valid_tokens = get_valid_api_tokens()
+
+    if not valid_tokens:
+        raise HTTPException(
+            status_code=500,
+            detail="API_TOKENS no configurado en el servidor"
+        )
+
+    if credentials.credentials not in valid_tokens:
+        raise HTTPException(
+            status_code=401,
+            detail="Token de autenticación inválido"
+        )
+
+    return credentials.credentials
+
 
 BASE_URL = "https://backend.juanleon.cl"
 ENDPOINT_DESPACHO = "/api/admin/despachos/{codigo}"
@@ -435,7 +465,7 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
 
 
 @sgd_router.get("/consultar/{codigo_despacho}")
-async def consultar_despacho(codigo_despacho: str):
+async def consultar_despacho(codigo_despacho: str, token: str = Depends(verify_api_token)):
     """
     Consulta la información del despacho y lista los documentos disponibles.
     Soporta tanto ID interno como código visible.
@@ -522,7 +552,7 @@ async def consultar_despacho(codigo_despacho: str):
 
 
 @sgd_router.post("/procesar/{codigo_despacho}", response_model=ProcesamientoResponse)
-async def procesar_despacho(codigo_despacho: str):
+async def procesar_despacho(codigo_despacho: str, token: str = Depends(verify_api_token)):
     """
     Procesa el despacho completo:
     1. Análisis y corrección de calidad
@@ -625,7 +655,7 @@ async def procesar_despacho(codigo_despacho: str):
 
 
 @documentos_router.post("/procesar", response_model=ProcesamientoIndividualResponse)
-async def procesar_documento_individual(file: UploadFile = File(...)):
+async def procesar_documento_individual(file: UploadFile = File(...), token: str = Depends(verify_api_token)):
     """
     Procesa un documento individual completo:
     - Soporta archivos PDF y Excel (.xls, .xlsx, .xlsm, etc.)
