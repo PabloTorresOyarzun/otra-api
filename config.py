@@ -7,6 +7,12 @@ class Settings(BaseSettings):
     BEARER_TOKEN: str
     AZURE_ENDPOINT: str
     AZURE_KEY: str
+
+    # API Authentication - Tokens permitidos para acceder a la API
+    API_TOKENS: str = ""  # Tokens separados por comas
+
+    # Admin Token - Token especial para gestionar el mantenedor de tokens
+    ADMIN_TOKEN: str = ""  # Token de administrador para endpoints de gestión
     
     # HTTP Timeouts
     TIMEOUT_CONNECT: float = 5.0
@@ -53,3 +59,12 @@ def calcular_timeout_excel(file_size_bytes: int) -> int:
     file_size_mb = file_size_bytes / (1024 * 1024)
     timeout = settings.TIMEOUT_EXCEL_BASE + int(file_size_mb * settings.TIMEOUT_EXCEL_PER_MB)
     return min(timeout, settings.TIMEOUT_EXCEL_MAX)
+
+
+def get_valid_api_tokens() -> set:
+    """Obtiene el conjunto de tokens API válidos desde la configuración."""
+    settings = get_settings()
+    if not settings.API_TOKENS:
+        return set()
+    tokens = [token.strip() for token in settings.API_TOKENS.split(',') if token.strip()]
+    return set(tokens)
