@@ -101,7 +101,8 @@ ENDPOINT_DOCUMENTOS = "/api/admin/documentos64/despacho/{codigo_visible}"
 
 # Azure Document Intelligence Custom Models
 AZURE_DI_ENDPOINT = "http://azure-di-custom:5000"
-API_VERSION = "2022-08-31"
+API_VERSION = "2022-08-31"  # Para gestión de modelos (build, list, delete)
+API_VERSION_ANALYZE = "2024-11-30"  # Para análisis de documentos
 
 # Mapeo de tipos de documento a model IDs de Azure DI
 DOCUMENT_TYPE_TO_MODEL = {
@@ -458,7 +459,7 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
     Returns:
         Diccionario con los campos extraídos, o None si hubo error
     """
-    url = f"{AZURE_DI_ENDPOINT}/formrecognizer/documentModels/{model_id}:analyze?api-version={API_VERSION}"
+    url = f"{AZURE_DI_ENDPOINT}/documentintelligence/documentModels/{model_id}:analyze?api-version={API_VERSION_ANALYZE}"
 
     timeout_config = httpx.Timeout(
         connect=settings.TIMEOUT_CONNECT,
