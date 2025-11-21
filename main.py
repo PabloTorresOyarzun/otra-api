@@ -477,35 +477,45 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
 
         async with httpx.AsyncClient(timeout=timeout_config) as client:
             # Iniciar análisis
+            print(f"[DEBUG] POST {url}")
             response = await client.post(url, json=payload)
+            print(f"[DEBUG] Respuesta inicial: {response.status_code}")
 
             if response.status_code != 202:
+                print(f"[DEBUG] Error: esperaba 202, recibió {response.status_code}: {response.text}")
                 return None
 
             # Obtener URL de operación
             operation_location = response.headers.get('Operation-Location')
             if not operation_location:
+                print(f"[DEBUG] Error: no se recibió Operation-Location")
                 return None
+
+            print(f"[DEBUG] Polling en: {operation_location}")
 
             # Esperar a que termine el análisis (polling)
             max_intentos = 60  # 5 minutos máximo (60 * 5s)
-            for _ in range(max_intentos):
+            for intento in range(max_intentos):
                 status_response = await client.get(operation_location)
 
                 if status_response.status_code != 200:
+                    print(f"[DEBUG] Error en polling: {status_response.status_code}")
                     return None
 
                 resultado = status_response.json()
                 status = resultado.get('status')
+                print(f"[DEBUG] Intento {intento+1}: status={status}")
 
                 if status == 'succeeded':
                     # Extraer datos del resultado
                     analyze_result = resultado.get('analyzeResult', {})
                     documentos = analyze_result.get('documents', [])
+                    print(f"[DEBUG] Análisis exitoso. Documentos encontrados: {len(documentos)}")
 
                     if documentos:
                         # Retornar los campos del primer documento
                         fields = documentos[0].get('fields', {})
+                        print(f"[DEBUG] Campos extraídos: {len(fields)}")
 
                         # Simplificar la estructura de los campos
                         datos_extraidos = {}
@@ -525,18 +535,25 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
                                 elif 'content' in field_data:
                                     datos_extraidos[field_name] = field_data['content']
 
+                        print(f"[DEBUG] Datos simplificados: {list(datos_extraidos.keys())}")
                         return datos_extraidos
                     return {}
 
                 elif status == 'failed':
+                    error_info = resultado.get('error', {})
+                    print(f"[DEBUG] Análisis falló: {error_info}")
                     return None
 
                 # Esperar 5 segundos antes de verificar de nuevo
                 await asyncio.sleep(5)
 
+            print(f"[DEBUG] Timeout: se excedió el máximo de intentos")
             return None
 
-    except Exception:
+    except Exception as e:
+        print(f"[DEBUG] Excepción en extraer_datos_con_modelo: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -638,15 +655,19 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
                 try:
                     # Verificar si el modelo está entrenado
                     modelo_entrenado = await verificar_modelo_entrenado(model_id)
+                    print(f"[DEBUG] Tipo: {tipo_documento}, Model ID: {model_id}, Entrenado: {modelo_entrenado}")
 
                     if modelo_entrenado:
                         # Extraer datos usando el modelo custom
+                        print(f"[DEBUG] Iniciando extracción para {model_id}...")
                         datos_extraidos = await extraer_datos_con_modelo(
                             doc_seg['pdf_bytes'],
                             model_id
                         )
-                except Exception:
+                        print(f"[DEBUG] Extracción completada. Datos: {datos_extraidos is not None}")
+                except Exception as e:
                     # Si hay error en la extracción, continuar sin datos extraídos
+                    print(f"[DEBUG] Error en extracción: {str(e)}")
                     datos_extraidos = None
 
             documentos_finales.append({
