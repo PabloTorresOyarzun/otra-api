@@ -461,6 +461,10 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
     """
     url = f"{AZURE_DI_ENDPOINT}/documentintelligence/documentModels/{model_id}:analyze?api-version={API_VERSION_ANALYZE}"
 
+    headers = {
+        "Content-Type": "application/pdf"
+    }
+
     timeout_config = httpx.Timeout(
         connect=settings.TIMEOUT_CONNECT,
         read=300.0,  # 5 minutos para análisis
@@ -469,17 +473,10 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
     )
 
     try:
-        # Convertir PDF a base64
-        pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
-
-        payload = {
-            "base64Source": pdf_base64
-        }
-
         async with httpx.AsyncClient(timeout=timeout_config) as client:
             # Iniciar análisis
             print(f"[DEBUG] POST {url}")
-            response = await client.post(url, json=payload)
+            response = await client.post(url, headers=headers, content=pdf_bytes)
             print(f"[DEBUG] Respuesta inicial: {response.status_code}")
 
             if response.status_code != 202:
