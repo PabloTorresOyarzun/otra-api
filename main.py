@@ -459,8 +459,10 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
     Returns:
         Diccionario con los campos extraídos, o None si hubo error
     """
-    # Probar con /formrecognizer/ y versión más reciente que soporte análisis
-    url = f"{AZURE_DI_ENDPOINT}/formrecognizer/documentModels/{model_id}:analyze?api-version=2023-07-31"
+    # El análisis con modelos custom en contenedores se hace usando azure-di-layout
+    # que soporta modelId para modelos custom entrenados
+    azure_layout_endpoint = "http://azure-di-layout:5000"
+    url = f"{azure_layout_endpoint}/formrecognizer/documentModels/{model_id}:analyze?api-version=2022-08-31"
 
     headers = {
         "Content-Type": "application/pdf"
