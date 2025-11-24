@@ -99,6 +99,22 @@ BASE_URL = "https://backend.juanleon.cl"
 ENDPOINT_DESPACHO = "/api/admin/despachos/{codigo}"
 ENDPOINT_DOCUMENTOS = "/api/admin/documentos64/despacho/{codigo_visible}"
 
+# Azure Document Intelligence Custom Models
+AZURE_DI_ENDPOINT = "http://azure-di-custom:5000"
+API_VERSION = "2022-08-31"  # Para gestión de modelos (build, list, delete)
+API_VERSION_ANALYZE = "2024-11-30"  # Para análisis de documentos
+
+# Mapeo de tipos de documento a model IDs de Azure DI
+DOCUMENT_TYPE_TO_MODEL = {
+    "FACTURA_COMERCIAL": "invoice",
+    "DOCUMENTO_TRANSPORTE": "transport",
+    "CERTIFICADO_ORIGEN": "origin",
+    "LISTA_EMBALAJE": "packing-list",
+    "CERTIFICADO_SANITARIO": "health",
+    "POLIZA_SEGURO": "insurance",
+    "UNKNOWN_DOCUMENT": None
+}
+
 # Almacenamiento en memoria
 documentos_finales_sgd: Dict[str, List[Dict]] = {}
 documentos_finales_individuales: Dict[str, List[Dict]] = {}
@@ -141,6 +157,7 @@ class DocumentoFinal(BaseModel):
     tipo: str
     paginas: List[int]
     alertas: Optional[List[Alerta]] = None
+    datos_extraidos: Optional[Dict[str, Any]] = None
 
 
 class ProcesamientoResponse(BaseModel):
@@ -394,7 +411,7 @@ async def convertir_excel_a_pdf(excel_bytes: bytes, nombre_archivo: str) -> byte
     """Convierte un archivo Excel a PDF de forma asíncrona con timeout dinámico."""
     timeout = calcular_timeout_excel(len(excel_bytes))
     loop = asyncio.get_event_loop()
-    
+
     try:
         return await asyncio.wait_for(
             loop.run_in_executor(
@@ -410,6 +427,133 @@ async def convertir_excel_a_pdf(excel_bytes: bytes, nombre_archivo: str) -> byte
             status_code=408,
             detail=f"Conversión Excel excedió el tiempo límite de {timeout}s"
         )
+
+
+async def verificar_modelo_entrenado(model_id: str) -> bool:
+    """Verifica si un modelo custom está entrenado en Azure DI."""
+    url = f"{AZURE_DI_ENDPOINT}/formrecognizer/documentModels/{model_id}?api-version={API_VERSION}"
+
+    timeout_config = httpx.Timeout(
+        connect=settings.TIMEOUT_CONNECT,
+        read=settings.TIMEOUT_READ,
+        write=settings.TIMEOUT_WRITE,
+        pool=5.0
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
+            response = await client.get(url)
+            return response.status_code == 200
+    except Exception:
+        return False
+
+
+async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Extrae datos estructurados de un PDF usando un modelo custom de Azure DI.
+
+    Args:
+        pdf_bytes: Bytes del PDF a analizar
+        model_id: ID del modelo custom a usar
+
+    Returns:
+        Diccionario con los campos extraídos, o None si hubo error
+    """
+    # Los modelos custom están en el contenedor azure-di-custom
+    url = f"{AZURE_DI_ENDPOINT}/formrecognizer/documentModels/{model_id}:analyze?api-version=2023-07-31"
+
+    headers = {
+        "Content-Type": "application/pdf"
+    }
+
+    timeout_config = httpx.Timeout(
+        connect=settings.TIMEOUT_CONNECT,
+        read=300.0,  # 5 minutos para análisis
+        write=settings.TIMEOUT_WRITE,
+        pool=5.0
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
+            # Iniciar análisis
+            print(f"[DEBUG] POST {url}")
+            response = await client.post(url, headers=headers, content=pdf_bytes)
+            print(f"[DEBUG] Respuesta inicial: {response.status_code}")
+
+            if response.status_code != 202:
+                print(f"[DEBUG] Error: esperaba 202, recibió {response.status_code}: {response.text}")
+                return None
+
+            # Obtener URL de operación
+            operation_location = response.headers.get('Operation-Location')
+            if not operation_location:
+                print(f"[DEBUG] Error: no se recibió Operation-Location")
+                return None
+
+            print(f"[DEBUG] Polling en: {operation_location}")
+
+            # Esperar a que termine el análisis (polling)
+            max_intentos = 60  # 5 minutos máximo (60 * 5s)
+            for intento in range(max_intentos):
+                status_response = await client.get(operation_location)
+
+                if status_response.status_code != 200:
+                    print(f"[DEBUG] Error en polling: {status_response.status_code}")
+                    return None
+
+                resultado = status_response.json()
+                status = resultado.get('status')
+                print(f"[DEBUG] Intento {intento+1}: status={status}")
+
+                if status == 'succeeded':
+                    # Extraer datos del resultado
+                    analyze_result = resultado.get('analyzeResult', {})
+                    documentos = analyze_result.get('documents', [])
+                    print(f"[DEBUG] Análisis exitoso. Documentos encontrados: {len(documentos)}")
+
+                    if documentos:
+                        # Retornar los campos del primer documento
+                        fields = documentos[0].get('fields', {})
+                        print(f"[DEBUG] Campos extraídos: {len(fields)}")
+
+                        # Simplificar la estructura de los campos
+                        datos_extraidos = {}
+                        for field_name, field_data in fields.items():
+                            if isinstance(field_data, dict):
+                                # Extraer el valor según el tipo
+                                if 'valueString' in field_data:
+                                    datos_extraidos[field_name] = field_data['valueString']
+                                elif 'valueNumber' in field_data:
+                                    datos_extraidos[field_name] = field_data['valueNumber']
+                                elif 'valueDate' in field_data:
+                                    datos_extraidos[field_name] = field_data['valueDate']
+                                elif 'valueArray' in field_data:
+                                    datos_extraidos[field_name] = field_data['valueArray']
+                                elif 'valueObject' in field_data:
+                                    datos_extraidos[field_name] = field_data['valueObject']
+                                elif 'content' in field_data:
+                                    datos_extraidos[field_name] = field_data['content']
+
+                        print(f"[DEBUG] Datos simplificados: {list(datos_extraidos.keys())}")
+                        return datos_extraidos
+                    return {}
+
+                elif status == 'failed':
+                    error_info = resultado.get('error', {})
+                    print(f"[DEBUG] Análisis falló: {error_info}")
+                    return None
+
+                # Esperar 5 segundos antes de verificar de nuevo
+                await asyncio.sleep(5)
+
+            print(f"[DEBUG] Timeout: se excedió el máximo de intentos")
+            return None
+
+    except Exception as e:
+        print(f"[DEBUG] Excepción en extraer_datos_con_modelo: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def _procesar_calidad_sync(pdf_bytes: bytes) -> tuple:
@@ -433,8 +577,9 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
     1. Análisis y corrección de calidad
     2. Clasificación de páginas
     3. Segmentación de documentos
-    
-    Retorna documentos finales segmentados con alertas de calidad.
+    4. Extracción de datos con modelos custom (si están entrenados)
+
+    Retorna documentos finales segmentados con alertas de calidad y datos extraídos.
     """
     try:
         loop = asyncio.get_event_loop()
@@ -443,20 +588,20 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
             _procesar_calidad_sync,
             pdf_bytes
         )
-        
+
         clasificaciones = await clasificar_documento_completo(pdf_bytes)
-        
+
         documentos_segmentados = await loop.run_in_executor(
             executor,
             segmentar_pdf,
             pdf_bytes,
             clasificaciones
         )
-        
+
         alertas_por_documento = {}
         for resultado in resultados_paso_1:
             alertas = []
-            
+
             if resultado['escaneada']:
                 if 'INCLINADA' in resultado['orientacion']:
                     alertas.append({
@@ -470,48 +615,76 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
                         "tipo": "escaneado",
                         "descripcion": f"Página escaneada: {resultado['orientacion']}"
                     })
-            
+
             if resultado['rotacion_formal'] != 0:
                 alertas.append({
                     "pagina": resultado['pagina'],
                     "tipo": "rotado",
                     "descripcion": f"Rotación de {resultado['rotacion_formal']}° corregida"
                 })
-            
+
             if not resultado['escaneada'] and resultado['orientacion'] == 'ROTADA':
                 alertas.append({
                     "pagina": resultado['pagina'],
                     "tipo": "rotado",
                     "descripcion": "Texto vertical corregido"
                 })
-            
+
             if alertas:
                 alertas_por_documento[resultado['pagina']] = alertas
-        
+
         documentos_finales = []
         for idx, doc_seg in enumerate(documentos_segmentados):
             alertas_segmento = []
             for pagina in doc_seg['paginas']:
                 if pagina in alertas_por_documento:
                     alertas_segmento.extend(alertas_por_documento[pagina])
-            
+
             nombre_salida = f"{nombre_archivo.replace('.pdf', '')}_{doc_seg['tipo']}_{idx+1}.pdf"
-            
+
+            # Obtener el model_id correspondiente al tipo de documento
+            tipo_documento = doc_seg['tipo']
+            model_id = DOCUMENT_TYPE_TO_MODEL.get(tipo_documento)
+
+            # Inicializar datos extraídos como None
+            datos_extraidos = None
+
+            # Si hay un modelo asociado, intentar extraer datos
+            if model_id:
+                try:
+                    # Verificar si el modelo está entrenado
+                    modelo_entrenado = await verificar_modelo_entrenado(model_id)
+                    print(f"[DEBUG] Tipo: {tipo_documento}, Model ID: {model_id}, Entrenado: {modelo_entrenado}")
+
+                    if modelo_entrenado:
+                        # Extraer datos usando el modelo custom
+                        print(f"[DEBUG] Iniciando extracción para {model_id}...")
+                        datos_extraidos = await extraer_datos_con_modelo(
+                            doc_seg['pdf_bytes'],
+                            model_id
+                        )
+                        print(f"[DEBUG] Extracción completada. Datos: {datos_extraidos is not None}")
+                except Exception as e:
+                    # Si hay error en la extracción, continuar sin datos extraídos
+                    print(f"[DEBUG] Error en extracción: {str(e)}")
+                    datos_extraidos = None
+
             documentos_finales.append({
                 "archivo_origen": nombre_archivo,
                 "nombre_salida": nombre_salida,
                 "tipo": doc_seg['tipo'],
                 "paginas": doc_seg['paginas'],
                 "pdf_bytes": doc_seg['pdf_bytes'],
-                "alertas": alertas_segmento if alertas_segmento else None
+                "alertas": alertas_segmento if alertas_segmento else None,
+                "datos_extraidos": datos_extraidos
             })
-        
+
         return {
             "documentos_finales": documentos_finales,
             "clasificaciones": clasificaciones,
             "error": None
         }
-        
+
     except Exception as e:
         return {
             "documentos_finales": [],
@@ -697,9 +870,10 @@ async def procesar_despacho(codigo_despacho: str, token: str = Depends(verify_ap
             nombre_salida=doc_final["nombre_salida"],
             tipo=doc_final["tipo"],
             paginas=doc_final["paginas"],
-            alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None
+            alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None,
+            datos_extraidos=doc_final.get("datos_extraidos")
         ))
-    
+
     return ProcesamientoResponse(
         codigo_despacho=codigo_despacho,
         cliente=cliente_nombre,
@@ -773,9 +947,10 @@ async def procesar_documento_individual(file: UploadFile = File(...), token: str
                 nombre_salida=doc_final["nombre_salida"],
                 tipo=doc_final["tipo"],
                 paginas=doc_final["paginas"],
-                alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None
+                alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None,
+                datos_extraidos=doc_final.get("datos_extraidos")
             ))
-        
+
         return ProcesamientoIndividualResponse(
             archivo_origen=file.filename,
             total_documentos_segmentados=len(docs_response),

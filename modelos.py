@@ -291,7 +291,26 @@ async def entrenar_modelo(
         async with httpx.AsyncClient(timeout=timeout_config) as client:
             response = await client.post(url, json=payload)
             
-            if response.status_code != 202:
+            if response.status_code == 409:
+                # El modelo ya existe, intentar eliminarlo primero
+                delete_url = f"{AZURE_DI_ENDPOINT}/formrecognizer/documentModels/{model_id}?api-version={API_VERSION}"
+                delete_response = await client.delete(delete_url)
+                
+                if delete_response.status_code in [204, 404]:
+                    # Reintentar entrenamiento después de eliminar
+                    response = await client.post(url, json=payload)
+                    
+                    if response.status_code != 202:
+                        raise HTTPException(
+                            status_code=response.status_code,
+                            detail=f"Error al reintentar entrenamiento: {response.text}"
+                        )
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"El modelo '{model_id}' ya existe y no se pudo eliminar. Elimínalo manualmente primero usando: DELETE /modelos/eliminar/{model_id}"
+                    )
+            elif response.status_code != 202:
                 raise HTTPException(
                     status_code=response.status_code,
                     detail=f"Error iniciando entrenamiento: {response.text}"
