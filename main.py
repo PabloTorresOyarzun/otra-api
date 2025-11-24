@@ -571,6 +571,100 @@ def _procesar_calidad_sync(pdf_bytes: bytes) -> tuple:
     return pdf_bytes, resultados_paso_1
 
 
+async def clasificar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[str, Any]:
+    """
+    Flujo de clasificación de PDF (sin extracción de datos):
+    1. Análisis y corrección de calidad
+    2. Clasificación de páginas
+    3. Segmentación de documentos
+
+    Retorna documentos finales segmentados con alertas de calidad pero sin extracción de datos.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        pdf_bytes, resultados_paso_1 = await loop.run_in_executor(
+            executor,
+            _procesar_calidad_sync,
+            pdf_bytes
+        )
+
+        clasificaciones = await clasificar_documento_completo(pdf_bytes)
+
+        documentos_segmentados = await loop.run_in_executor(
+            executor,
+            segmentar_pdf,
+            pdf_bytes,
+            clasificaciones
+        )
+
+        alertas_por_documento = {}
+        for resultado in resultados_paso_1:
+            alertas = []
+
+            if resultado['escaneada']:
+                if 'INCLINADA' in resultado['orientacion']:
+                    alertas.append({
+                        "pagina": resultado['pagina'],
+                        "tipo": "inclinado",
+                        "descripcion": f"Página escaneada {resultado['orientacion']}"
+                    })
+                elif resultado['orientacion'] not in ['NORMAL', 'SIN TEXTO', 'SIN IMAGEN']:
+                    alertas.append({
+                        "pagina": resultado['pagina'],
+                        "tipo": "escaneado",
+                        "descripcion": f"Página escaneada: {resultado['orientacion']}"
+                    })
+
+            if resultado['rotacion_formal'] != 0:
+                alertas.append({
+                    "pagina": resultado['pagina'],
+                    "tipo": "rotado",
+                    "descripcion": f"Rotación de {resultado['rotacion_formal']}° corregida"
+                })
+
+            if not resultado['escaneada'] and resultado['orientacion'] == 'ROTADA':
+                alertas.append({
+                    "pagina": resultado['pagina'],
+                    "tipo": "rotado",
+                    "descripcion": "Texto vertical corregido"
+                })
+
+            if alertas:
+                alertas_por_documento[resultado['pagina']] = alertas
+
+        documentos_finales = []
+        for idx, doc_seg in enumerate(documentos_segmentados):
+            alertas_segmento = []
+            for pagina in doc_seg['paginas']:
+                if pagina in alertas_por_documento:
+                    alertas_segmento.extend(alertas_por_documento[pagina])
+
+            nombre_salida = f"{nombre_archivo.replace('.pdf', '')}_{doc_seg['tipo']}_{idx+1}.pdf"
+
+            documentos_finales.append({
+                "archivo_origen": nombre_archivo,
+                "nombre_salida": nombre_salida,
+                "tipo": doc_seg['tipo'],
+                "paginas": doc_seg['paginas'],
+                "pdf_bytes": doc_seg['pdf_bytes'],
+                "alertas": alertas_segmento if alertas_segmento else None,
+                "datos_extraidos": None
+            })
+
+        return {
+            "documentos_finales": documentos_finales,
+            "clasificaciones": clasificaciones,
+            "error": None
+        }
+
+    except Exception as e:
+        return {
+            "documentos_finales": [],
+            "clasificaciones": [],
+            "error": str(e)
+        }
+
+
 async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[str, Any]:
     """
     Flujo completo de procesamiento de PDF:
@@ -780,6 +874,111 @@ async def consultar_despacho(codigo_despacho: str, token: str = Depends(verify_a
     raise HTTPException(status_code=404, detail="Despacho no encontrado")
 
 
+@sgd_router.post("/clasificar/{codigo_despacho}", response_model=ProcesamientoResponse)
+async def clasificar_despacho(codigo_despacho: str, token: str = Depends(verify_api_token)):
+    """
+    Clasifica los documentos del despacho:
+    1. Análisis y corrección de calidad
+    2. Clasificación de páginas
+    3. Segmentación de documentos
+
+    No incluye extracción de datos con modelos.
+    Almacena solo documentos finales segmentados en memoria.
+    """
+    if not settings.BEARER_TOKEN:
+        raise HTTPException(status_code=500, detail="BEARER_TOKEN no configurado")
+
+    datos_despacho_detalle = await consultar_despacho_detalle(codigo_despacho, settings.BEARER_TOKEN)
+
+    codigo_visible = None
+    cliente_nombre = "N/A"
+    estado_despacho = "N/A"
+    tipo_despacho = "N/A"
+
+    if datos_despacho_detalle and "data" in datos_despacho_detalle:
+        despacho_data = datos_despacho_detalle["data"]
+        if isinstance(despacho_data, dict):
+            codigo_visible = str(despacho_data.get("codigo", ""))
+            cliente = despacho_data.get("cliente", {})
+            cliente_nombre = cliente.get("nombre", "N/A") if isinstance(cliente, dict) else "N/A"
+            estado_despacho = despacho_data.get("estado_despacho", "N/A")
+            tipo_despacho = despacho_data.get("tipo_despacho", "N/A")
+
+    documentos_base64_list = None
+
+    if codigo_visible:
+        documentos_base64_list = await consultar_documentacion(codigo_visible, settings.BEARER_TOKEN)
+
+    if not documentos_base64_list:
+        documentos_base64_list = await consultar_documentacion(codigo_despacho, settings.BEARER_TOKEN)
+
+    if not documentos_base64_list or not isinstance(documentos_base64_list, list):
+        raise HTTPException(status_code=404, detail="No se pudieron obtener los documentos")
+
+    todos_documentos_finales = []
+
+    for doc in documentos_base64_list:
+        if isinstance(doc, dict):
+            base64_data = doc.get("documento", "")
+
+            if ',' in base64_data:
+                _, base64_content = base64_data.split(',', 1)
+            else:
+                base64_content = base64_data
+
+            try:
+                file_bytes = base64.b64decode(base64_content)
+                nombre_documento = doc.get("nombre_documento", "documento.pdf")
+
+                validar_tamano_archivo(file_bytes)
+
+                if es_archivo_excel(nombre_documento):
+                    if not validar_excel(file_bytes, nombre_documento):
+                        continue
+                    try:
+                        pdf_bytes = await convertir_excel_a_pdf(file_bytes, nombre_documento)
+                        nombre_procesamiento = nombre_documento.rsplit('.', 1)[0] + '.pdf'
+                    except Exception:
+                        continue
+                else:
+                    if not validar_pdf(file_bytes):
+                        continue
+                    pdf_bytes = file_bytes
+                    nombre_procesamiento = nombre_documento
+
+                resultado = await clasificar_pdf_completo(pdf_bytes, nombre_procesamiento)
+
+                if resultado["error"]:
+                    continue
+
+                todos_documentos_finales.extend(resultado["documentos_finales"])
+
+            except Exception:
+                continue
+
+    documentos_finales_sgd[codigo_despacho] = todos_documentos_finales
+
+    docs_response = []
+    for doc_final in todos_documentos_finales:
+        docs_response.append(DocumentoFinal(
+            archivo_origen=doc_final["archivo_origen"],
+            nombre_salida=doc_final["nombre_salida"],
+            tipo=doc_final["tipo"],
+            paginas=doc_final["paginas"],
+            alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None,
+            datos_extraidos=doc_final.get("datos_extraidos")
+        ))
+
+    return ProcesamientoResponse(
+        codigo_despacho=codigo_despacho,
+        cliente=cliente_nombre,
+        estado=estado_despacho,
+        tipo=tipo_despacho,
+        total_documentos_segmentados=len(docs_response),
+        documentos=docs_response
+    )
+
+
 @sgd_router.post("/procesar/{codigo_despacho}", response_model=ProcesamientoResponse)
 async def procesar_despacho(codigo_despacho: str, token: str = Depends(verify_api_token)):
     """
@@ -787,7 +986,7 @@ async def procesar_despacho(codigo_despacho: str, token: str = Depends(verify_ap
     1. Análisis y corrección de calidad
     2. Clasificación de páginas
     3. Segmentación de documentos
-    
+
     Almacena solo documentos finales segmentados en memoria.
     """
     if not settings.BEARER_TOKEN:
@@ -884,6 +1083,85 @@ async def procesar_despacho(codigo_despacho: str, token: str = Depends(verify_ap
     )
 
 
+@documentos_router.post("/clasificar", response_model=ProcesamientoIndividualResponse)
+async def clasificar_documento_individual(file: UploadFile = File(...), token: str = Depends(verify_api_token)):
+    """
+    Clasifica un documento individual:
+    - Soporta archivos PDF y Excel (.xls, .xlsx, .xlsm, etc.)
+    - Los archivos Excel se convierten automáticamente a PDF
+    - Valida el tipo MIME real del archivo
+
+    Flujo:
+    1. Validación de tipo de archivo
+    2. Conversión Excel a PDF (si aplica)
+    3. Análisis y corrección de calidad
+    4. Clasificación de páginas
+    5. Segmentación de documentos
+
+    No incluye extracción de datos con modelos.
+    Almacena solo documentos finales segmentados en memoria.
+    """
+    nombre_archivo = file.filename.lower()
+    es_pdf = nombre_archivo.endswith('.pdf')
+    es_excel = es_archivo_excel(file.filename)
+
+    if not es_pdf and not es_excel:
+        raise HTTPException(
+            status_code=400,
+            detail="Solo se aceptan archivos PDF o Excel (.xls, .xlsx, .xlsm, .xlsb, .xltx, .xltm)"
+        )
+
+    try:
+        file_bytes = await file.read()
+
+        validar_tamano_archivo(file_bytes)
+
+        if es_excel:
+            if not validar_excel(file_bytes, file.filename):
+                raise HTTPException(
+                    status_code=400,
+                    detail="El archivo no es un Excel válido"
+                )
+            pdf_bytes = await convertir_excel_a_pdf(file_bytes, file.filename)
+            nombre_procesamiento = file.filename.rsplit('.', 1)[0] + '.pdf'
+        else:
+            if not validar_pdf(file_bytes):
+                raise HTTPException(
+                    status_code=400,
+                    detail="El archivo no es un PDF válido"
+                )
+            pdf_bytes = file_bytes
+            nombre_procesamiento = file.filename
+
+        resultado = await clasificar_pdf_completo(pdf_bytes, nombre_procesamiento)
+
+        if resultado["error"]:
+            raise HTTPException(status_code=500, detail=f"Error al clasificar: {resultado['error']}")
+
+        documentos_finales_individuales[file.filename] = resultado["documentos_finales"]
+
+        docs_response = []
+        for doc_final in resultado["documentos_finales"]:
+            docs_response.append(DocumentoFinal(
+                archivo_origen=doc_final["archivo_origen"],
+                nombre_salida=doc_final["nombre_salida"],
+                tipo=doc_final["tipo"],
+                paginas=doc_final["paginas"],
+                alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None,
+                datos_extraidos=doc_final.get("datos_extraidos")
+            ))
+
+        return ProcesamientoIndividualResponse(
+            archivo_origen=file.filename,
+            total_documentos_segmentados=len(docs_response),
+            documentos=docs_response
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al clasificar documento: {str(e)}")
+
+
 @documentos_router.post("/procesar", response_model=ProcesamientoIndividualResponse)
 async def procesar_documento_individual(file: UploadFile = File(...), token: str = Depends(verify_api_token)):
     """
@@ -891,14 +1169,14 @@ async def procesar_documento_individual(file: UploadFile = File(...), token: str
     - Soporta archivos PDF y Excel (.xls, .xlsx, .xlsm, etc.)
     - Los archivos Excel se convierten automáticamente a PDF
     - Valida el tipo MIME real del archivo
-    
+
     Flujo:
     1. Validación de tipo de archivo
     2. Conversión Excel a PDF (si aplica)
     3. Análisis y corrección de calidad
     4. Clasificación de páginas
     5. Segmentación de documentos
-    
+
     Almacena solo documentos finales segmentados en memoria.
     """
     nombre_archivo = file.filename.lower()
