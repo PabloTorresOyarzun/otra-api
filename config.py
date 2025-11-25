@@ -37,13 +37,13 @@ class Settings(BaseSettings):
     # Límites
     MAX_FILE_SIZE_MB: int = 100
 
-    # Thread Pool (comentados - valores por defecto en código)
-    # EXECUTOR_MAX_WORKERS: int = 32
-    # EXECUTOR_MIN_WORKERS: int = 4
+    # Thread Pool - Configuración dinámica del executor
+    EXECUTOR_MAX_WORKERS: int = 32  # Máximo número de workers (se calcula como min(32, cpu_count * 4))
+    EXECUTOR_MIN_WORKERS: int = 4   # Mínimo número de workers como fallback
 
-    # Timeout para procesamiento de calidad (comentados - valores por defecto en código)
-    # TIMEOUT_QUALITY_BASE: int = 30
-    # TIMEOUT_QUALITY_PER_PAGE: int = 5
+    # Timeout para procesamiento de calidad - Adaptativo según número de páginas
+    TIMEOUT_QUALITY_BASE: int = 30       # Tiempo base en segundos para cualquier documento
+    TIMEOUT_QUALITY_PER_PAGE: int = 5    # Segundos adicionales por cada página del documento
 
     class Config:
         env_file = ".env"
@@ -73,15 +73,10 @@ def calcular_timeout_calidad(num_paginas: int) -> int:
     """
     Calcula timeout para procesamiento de calidad basado en número de páginas.
 
-    Valores por defecto:
-    - Base: 30s
-    - Por página: 5s
+    Formula: TIMEOUT_QUALITY_BASE + (num_paginas * TIMEOUT_QUALITY_PER_PAGE)
     """
-    # Valores por defecto (pueden ser sobrescritos en config si se descomenta)
-    TIMEOUT_QUALITY_BASE = 30
-    TIMEOUT_QUALITY_PER_PAGE = 5
-
-    timeout = TIMEOUT_QUALITY_BASE + (num_paginas * TIMEOUT_QUALITY_PER_PAGE)
+    settings = get_settings()
+    timeout = settings.TIMEOUT_QUALITY_BASE + (num_paginas * settings.TIMEOUT_QUALITY_PER_PAGE)
     return timeout
 
 

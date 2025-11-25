@@ -129,8 +129,8 @@ documentos_finales_sgd: Dict[str, List[Dict]] = {}
 documentos_finales_individuales: Dict[str, List[Dict]] = {}
 
 # Thread pool para operaciones CPU-bound (dinámico basado en CPU cores)
-# max_workers = min(32, cpu_count * 4) para balancear rendimiento y recursos
-executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
+# max_workers = min(EXECUTOR_MAX_WORKERS, cpu_count * 4) para balancear rendimiento y recursos
+executor = ThreadPoolExecutor(max_workers=min(settings.EXECUTOR_MAX_WORKERS, (os.cpu_count() or 1) * 4))
 logger.info(f"ThreadPoolExecutor inicializado con max_workers={executor._max_workers}")
 
 # Semaphore para limitar concurrencia de PDFs procesándose simultáneamente
