@@ -8,6 +8,8 @@ import io
 import fitz
 import sys
 import asyncio
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Optional, Dict, List, Any
@@ -21,7 +23,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 
 from quality import paso_1_analizar_documento, paso_2_corregir_rotacion
 from clasificacion import clasificar_documento_completo, segmentar_pdf
-from config import get_settings, calcular_timeout_excel, get_valid_api_tokens
+from config import get_settings, calcular_timeout_excel, calcular_timeout_calidad, get_valid_api_tokens
 from token_manager import token_manager
 from modelos import modelos_router
 
@@ -36,6 +38,13 @@ def suprimir_prints():
     finally:
         sys.stdout = original_stdout
 
+
+# Configurar logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 app = FastAPI(title="API Docs")
@@ -119,8 +128,14 @@ DOCUMENT_TYPE_TO_MODEL = {
 documentos_finales_sgd: Dict[str, List[Dict]] = {}
 documentos_finales_individuales: Dict[str, List[Dict]] = {}
 
-# Thread pool para operaciones CPU-bound
-executor = ThreadPoolExecutor(max_workers=4)
+# Thread pool para operaciones CPU-bound (dinámico basado en CPU cores)
+# max_workers = min(EXECUTOR_MAX_WORKERS, cpu_count * 4) para balancear rendimiento y recursos
+executor = ThreadPoolExecutor(max_workers=min(settings.EXECUTOR_MAX_WORKERS, (os.cpu_count() or 1) * 4))
+logger.info(f"ThreadPoolExecutor inicializado con max_workers={executor._max_workers}")
+
+# Semaphore para limitar concurrencia de PDFs procesándose simultáneamente
+MAX_CONCURRENT_PDFS = 10
+pdf_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PDFS)
 
 
 class DocumentoSimplificado(BaseModel):
@@ -410,10 +425,15 @@ def _convertir_excel_a_pdf_sync(excel_bytes: bytes, nombre_archivo: str) -> byte
 async def convertir_excel_a_pdf(excel_bytes: bytes, nombre_archivo: str) -> bytes:
     """Convierte un archivo Excel a PDF de forma asíncrona con timeout dinámico."""
     timeout = calcular_timeout_excel(len(excel_bytes))
+    file_size_mb = len(excel_bytes) / (1024 * 1024)
+
+    logger.info(f"Iniciando conversión Excel a PDF para {nombre_archivo} ({file_size_mb:.2f}MB, timeout={timeout}s)")
+    start_time = time.time()
+
     loop = asyncio.get_event_loop()
 
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             loop.run_in_executor(
                 executor,
                 _convertir_excel_a_pdf_sync,
@@ -422,7 +442,13 @@ async def convertir_excel_a_pdf(excel_bytes: bytes, nombre_archivo: str) -> byte
             ),
             timeout=timeout
         )
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"Conversión Excel completada para {nombre_archivo} en {elapsed_time:.2f}s")
+
+        return result
     except asyncio.TimeoutError:
+        logger.error(f"Conversión Excel excedió timeout para {nombre_archivo} ({timeout}s)")
         raise HTTPException(
             status_code=408,
             detail=f"Conversión Excel excedió el tiempo límite de {timeout}s"
@@ -581,14 +607,33 @@ async def clasificar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict
     Retorna documentos finales segmentados con alertas de calidad pero sin extracción de datos.
     """
     try:
+        # Obtener número de páginas para timeout adaptativo
+        pdf_doc_temp = fitz.open(stream=pdf_bytes, filetype="pdf")
+        num_paginas = len(pdf_doc_temp)
+        pdf_doc_temp.close()
+
+        timeout_calidad = calcular_timeout_calidad(num_paginas)
+
+        logger.info(f"Iniciando procesamiento de calidad para {nombre_archivo} ({num_paginas} páginas, timeout={timeout_calidad}s)")
+        start_time = time.time()
+
         loop = asyncio.get_event_loop()
-        pdf_bytes, resultados_paso_1 = await loop.run_in_executor(
-            executor,
-            _procesar_calidad_sync,
-            pdf_bytes
+        pdf_bytes, resultados_paso_1 = await asyncio.wait_for(
+            loop.run_in_executor(
+                executor,
+                _procesar_calidad_sync,
+                pdf_bytes
+            ),
+            timeout=timeout_calidad
         )
 
+        elapsed_time = time.time() - start_time
+        logger.info(f"Procesamiento de calidad completado para {nombre_archivo} en {elapsed_time:.2f}s")
+
         clasificaciones = await clasificar_documento_completo(pdf_bytes)
+
+        logger.info(f"Iniciando segmentación para {nombre_archivo}")
+        start_time = time.time()
 
         documentos_segmentados = await loop.run_in_executor(
             executor,
@@ -596,6 +641,9 @@ async def clasificar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict
             pdf_bytes,
             clasificaciones
         )
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"Segmentación completada para {nombre_archivo} en {elapsed_time:.2f}s - {len(documentos_segmentados)} documentos")
 
         alertas_por_documento = {}
         for resultado in resultados_paso_1:
@@ -657,7 +705,15 @@ async def clasificar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict
             "error": None
         }
 
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout en procesamiento de calidad para {nombre_archivo}")
+        return {
+            "documentos_finales": [],
+            "clasificaciones": [],
+            "error": f"Timeout en procesamiento de calidad ({timeout_calidad}s)"
+        }
     except Exception as e:
+        logger.error(f"Error en clasificar_pdf_completo para {nombre_archivo}: {str(e)}")
         return {
             "documentos_finales": [],
             "clasificaciones": [],
@@ -676,14 +732,33 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
     Retorna documentos finales segmentados con alertas de calidad y datos extraídos.
     """
     try:
+        # Obtener número de páginas para timeout adaptativo
+        pdf_doc_temp = fitz.open(stream=pdf_bytes, filetype="pdf")
+        num_paginas = len(pdf_doc_temp)
+        pdf_doc_temp.close()
+
+        timeout_calidad = calcular_timeout_calidad(num_paginas)
+
+        logger.info(f"Iniciando procesamiento de calidad para {nombre_archivo} ({num_paginas} páginas, timeout={timeout_calidad}s)")
+        start_time = time.time()
+
         loop = asyncio.get_event_loop()
-        pdf_bytes, resultados_paso_1 = await loop.run_in_executor(
-            executor,
-            _procesar_calidad_sync,
-            pdf_bytes
+        pdf_bytes, resultados_paso_1 = await asyncio.wait_for(
+            loop.run_in_executor(
+                executor,
+                _procesar_calidad_sync,
+                pdf_bytes
+            ),
+            timeout=timeout_calidad
         )
 
+        elapsed_time = time.time() - start_time
+        logger.info(f"Procesamiento de calidad completado para {nombre_archivo} en {elapsed_time:.2f}s")
+
         clasificaciones = await clasificar_documento_completo(pdf_bytes)
+
+        logger.info(f"Iniciando segmentación para {nombre_archivo}")
+        start_time = time.time()
 
         documentos_segmentados = await loop.run_in_executor(
             executor,
@@ -691,6 +766,9 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
             pdf_bytes,
             clasificaciones
         )
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"Segmentación completada para {nombre_archivo} en {elapsed_time:.2f}s - {len(documentos_segmentados)} documentos")
 
         alertas_por_documento = {}
         for resultado in resultados_paso_1:
@@ -779,7 +857,15 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
             "error": None
         }
 
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout en procesamiento de calidad para {nombre_archivo}")
+        return {
+            "documentos_finales": [],
+            "clasificaciones": [],
+            "error": f"Timeout en procesamiento de calidad ({timeout_calidad}s)"
+        }
     except Exception as e:
+        logger.error(f"Error en procesar_pdf_completo para {nombre_archivo}: {str(e)}")
         return {
             "documentos_finales": [],
             "clasificaciones": [],

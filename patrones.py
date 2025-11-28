@@ -101,6 +101,22 @@ PATRONES_INICIO = {
         "VERZEKERINGSBEWIJS", "POLIS",
         # Francés
         "POLICE D'ASSURANCE", "CERTIFICAT D'ASSURANCE"
+    ],
+
+    #DIN
+    "DIN": [
+        # Español
+        "DECLARACIÓN INFORMATIVA NACIONAL",
+        # Inglés
+        "NATIONAL INFORMATION DECLARATION",
+        # Alemán
+        "NATIONALE INFORMATIONSERKLÄRUNG",
+        # Portugués
+        "DECLARAÇÃO INFORMATIVA NACIONAL",
+        # Neerlandés
+        "NATIONALE INFORMATIEVERKLARING",
+        # Francés
+        "DÉCLARATION D'INFORMATION NATIONALE"
     ]
 }
 

@@ -36,7 +36,15 @@ class Settings(BaseSettings):
     
     # Límites
     MAX_FILE_SIZE_MB: int = 100
-    
+
+    # Thread Pool - Configuración dinámica del executor
+    EXECUTOR_MAX_WORKERS: int = 32  # Máximo número de workers (se calcula como min(32, cpu_count * 4))
+    EXECUTOR_MIN_WORKERS: int = 4   # Mínimo número de workers como fallback
+
+    # Timeout para procesamiento de calidad - Adaptativo según número de páginas
+    TIMEOUT_QUALITY_BASE: int = 30       # Tiempo base en segundos para cualquier documento
+    TIMEOUT_QUALITY_PER_PAGE: int = 5    # Segundos adicionales por cada página del documento
+
     class Config:
         env_file = ".env"
 
@@ -59,6 +67,17 @@ def calcular_timeout_excel(file_size_bytes: int) -> int:
     file_size_mb = file_size_bytes / (1024 * 1024)
     timeout = settings.TIMEOUT_EXCEL_BASE + int(file_size_mb * settings.TIMEOUT_EXCEL_PER_MB)
     return min(timeout, settings.TIMEOUT_EXCEL_MAX)
+
+
+def calcular_timeout_calidad(num_paginas: int) -> int:
+    """
+    Calcula timeout para procesamiento de calidad basado en número de páginas.
+
+    Formula: TIMEOUT_QUALITY_BASE + (num_paginas * TIMEOUT_QUALITY_PER_PAGE)
+    """
+    settings = get_settings()
+    timeout = settings.TIMEOUT_QUALITY_BASE + (num_paginas * settings.TIMEOUT_QUALITY_PER_PAGE)
+    return timeout
 
 
 def get_valid_api_tokens() -> set:
