@@ -29,6 +29,7 @@ PATRONES_INICIO = {
         "CONOCIMIENTO DE EMBARQUE", "GUÍA AÉREA", "CARTA DE PORTE",
         # Inglés
         "BILL OF LADING", "B/L", "WAYBILL", "AIR WAYBILL", "ROAD WAYBILL", "SEA WAYBILL",
+        "COMBINED TRANSPORT", "PORT TO PORT SHIPMENT",
         # Alemán
         "FRACHTBRIEF", "LUFTFRACHTBRIEF", 
         # Portugués
@@ -103,20 +104,36 @@ PATRONES_INICIO = {
         "POLICE D'ASSURANCE", "CERTIFICAT D'ASSURANCE"
     ],
 
-    #DIN
-    "DIN": [
+    # 7. DECLARACION DE INGRESO
+    "DECLARACION DE INGRESO": [
         # Español
-        "DECLARACIÓN INFORMATIVA NACIONAL",
+        "DECLARACIÓN DE INGRESO", "DECLARACION DE INGRESO",
         # Inglés
-        "NATIONAL INFORMATION DECLARATION",
+        "DECLARATION OF INCOME",
         # Alemán
-        "NATIONALE INFORMATIONSERKLÄRUNG",
+        "EINKOMMENSERKLÄRUNG",
         # Portugués
-        "DECLARAÇÃO INFORMATIVA NACIONAL",
+        "DECLARAÇÃO DE RENDA",
         # Neerlandés
-        "NATIONALE INFORMATIEVERKLARING",
+        "INKOMSTENVERKLARING",
         # Francés
-        "DÉCLARATION D'INFORMATION NATIONALE"
+        "DÉCLARATION DE REVENU"
+    ],
+
+    # 8. DECLARACION JURADA
+    "DECLARACION JURADA": [
+        # Español
+        "DECLARACIÓN JURADA",
+        # Inglés
+        "SWORN STATEMENT",
+        # Alemán
+        "EIDESSTATTLICHE ERKLÄRUNG",
+        # Portugués
+        "DECLARAÇÃO JURAMENTADA",
+        # Neerlandés
+        "GEZWOREN VERKLARING",
+        # Francés
+        "DÉCLARATION SOUS SERMENT"
     ]
 }
 

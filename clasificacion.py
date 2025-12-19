@@ -4,19 +4,20 @@ import asyncio
 from typing import List, Dict, Tuple
 from patrones import PATRONES_INICIO, PATRON_DEFAULT
 from config import get_settings, calcular_timeout_azure
+import re
 
 
 settings = get_settings()
 
 
 def recortar_header(pdf_bytes: bytes) -> bytes:
-    """Recorta el 30% superior de cada página del PDF."""
+    """Recorta el 35% superior de cada página del PDF."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     new_doc = fitz.open()
     
     for page in doc:
         rect = page.rect
-        crop_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * 0.3)
+        crop_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * 0.35)
         page.set_cropbox(crop_rect)
         new_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
     
@@ -105,18 +106,21 @@ async def extraer_texto_documento_completo(
 def clasificar_pagina(texto: str) -> str:
     """
     Clasifica una página buscando la aparición más temprana de cualquier
-    patrón de documento en el texto.
+    patrón de documento en el texto. Usa búsqueda de palabras completas
+    para evitar falsos positivos con subcadenas.
     """
     texto_upper = texto.upper()
     matches = []
     
     for tipo_documento, patrones in PATRONES_INICIO.items():
         for patron in patrones:
-            index = texto_upper.find(patron.upper())
+            # Buscar como palabra completa (word boundary)
+            pattern = r'\b' + re.escape(patron.upper()) + r'\b'
+            match = re.search(pattern, texto_upper)
             
-            if index != -1:
+            if match:
                 matches.append({
-                    "index": index,
+                    "index": match.start(),
                     "tipo": tipo_documento
                 })
     
