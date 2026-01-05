@@ -1,5 +1,11 @@
-from fastapi import FastAPI, HTTPException, APIRouter, File, UploadFile, Security, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from litestar import Litestar, get, post, delete, Router, Request
+from litestar.exceptions import HTTPException
+from litestar.datastructures import UploadFile
+from litestar.enums import RequestEncodingType
+from litestar.params import Body
+from litestar.openapi import OpenAPIConfig
+from litestar.openapi.spec import Components, SecurityScheme
+from litestar.status_codes import HTTP_200_OK, HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN, HTTP_404_NOT_FOUND, HTTP_408_REQUEST_TIMEOUT, HTTP_413_REQUEST_ENTITY_TOO_LARGE, HTTP_500_INTERNAL_SERVER_ERROR
 from pydantic import BaseModel
 import httpx
 import os
@@ -12,7 +18,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Annotated
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import pandas as pd
 from PIL import Image
@@ -30,7 +36,6 @@ from quality import paso_1_analizar_documento, paso_2_corregir_rotacion
 from clasificacion import clasificar_documento_completo, segmentar_pdf
 from config import get_settings, calcular_timeout_excel, calcular_timeout_calidad, get_valid_api_tokens
 from token_manager import token_manager
-from modelos import modelos_router
 
 
 @contextmanager
@@ -44,7 +49,6 @@ def suprimir_prints():
         sys.stdout = original_stdout
 
 
-# --- Configuración de Fuente para PDFs ---
 try:
     pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
     FUENTE_PRINCIPAL = 'STSong-Light'
@@ -52,7 +56,6 @@ except Exception:
     FUENTE_PRINCIPAL = 'Helvetica'
 
 
-# Configurar logger
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -60,73 +63,54 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
-app = FastAPI(title="API Docs")
-
-# Esquema de seguridad para autenticación con token
-security = HTTPBearer()
 
 
-def verify_api_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
-    """
-    Verifica que el token API proporcionado sea válido.
+def get_bearer_token(request: Request) -> str:
+    """Extrae el token Bearer del header Authorization."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="Token de autenticación requerido")
+    return auth_header[7:]
 
-    Uso en Postman:
-    - Header: Authorization
-    - Value: Bearer <tu-token-aqui>
-    """
-    # Si es el ADMIN_TOKEN, permitir acceso (admin tiene acceso a todo)
-    if settings.ADMIN_TOKEN and credentials.credentials == settings.ADMIN_TOKEN:
-        return credentials.credentials
 
-    # Verificar desde el gestor de tokens (modo persistente)
-    if token_manager.is_valid_token(credentials.credentials):
-        return credentials.credentials
+def verify_api_token(request: Request) -> str:
+    """Verifica que el token API proporcionado sea válido."""
+    token = get_bearer_token(request)
+    
+    if settings.ADMIN_TOKEN and token == settings.ADMIN_TOKEN:
+        return token
 
-    # Fallback: verificar desde API_TOKENS en .env (modo legacy)
+    if token_manager.is_valid_token(token):
+        return token
+
     valid_tokens = get_valid_api_tokens()
-    if valid_tokens and credentials.credentials in valid_tokens:
-        return credentials.credentials
+    if valid_tokens and token in valid_tokens:
+        return token
 
-    raise HTTPException(
-        status_code=401,
-        detail="Token de autenticación inválido"
-    )
+    raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="Token de autenticación inválido")
 
 
-def verify_admin_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
-    """
-    Verifica que el token de administrador sea válido.
-    Solo permite acceso a endpoints de gestión de tokens.
-
-    Uso en Postman:
-    - Header: Authorization
-    - Value: Bearer <admin-token>
-    """
+def verify_admin_token(request: Request) -> str:
+    """Verifica que el token de administrador sea válido."""
+    token = get_bearer_token(request)
+    
     if not settings.ADMIN_TOKEN:
-        raise HTTPException(
-            status_code=500,
-            detail="ADMIN_TOKEN no configurado en el servidor"
-        )
+        raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail="ADMIN_TOKEN no configurado en el servidor")
 
-    if credentials.credentials != settings.ADMIN_TOKEN:
-        raise HTTPException(
-            status_code=403,
-            detail="Se requiere token de administrador"
-        )
+    if token != settings.ADMIN_TOKEN:
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="Se requiere token de administrador")
 
-    return credentials.credentials
+    return token
 
 
 BASE_URL = "https://backend.juanleon.cl"
 ENDPOINT_DESPACHO = "/api/admin/despachos/{codigo}"
 ENDPOINT_DOCUMENTOS = "/api/admin/documentos64/despacho/{codigo_visible}"
 
-# Azure Document Intelligence Custom Models
 AZURE_DI_ENDPOINT = "http://azure-di-custom:5000"
-API_VERSION = "2022-08-31"  # Para gestión de modelos (build, list, delete)
-API_VERSION_ANALYZE = "2024-11-30"  # Para análisis de documentos
+API_VERSION = "2022-08-31"
+API_VERSION_ANALYZE = "2024-11-30"
 
-# Mapeo de tipos de documento a model IDs de Azure DI
 DOCUMENT_TYPE_TO_MODEL = {
     "FACTURA_COMERCIAL": "invoice",
     "DOCUMENTO_TRANSPORTE": "transport",
@@ -137,16 +121,12 @@ DOCUMENT_TYPE_TO_MODEL = {
     "UNKNOWN_DOCUMENT": None
 }
 
-# Almacenamiento en memoria
 documentos_finales_sgd: Dict[str, List[Dict]] = {}
 documentos_finales_individuales: Dict[str, List[Dict]] = {}
 
-# Thread pool para operaciones CPU-bound (dinámico basado en CPU cores)
-# max_workers = min(EXECUTOR_MAX_WORKERS, cpu_count * 4) para balancear rendimiento y recursos
 executor = ThreadPoolExecutor(max_workers=min(settings.EXECUTOR_MAX_WORKERS, (os.cpu_count() or 1) * 4))
 logger.info(f"ThreadPoolExecutor inicializado con max_workers={executor._max_workers}")
 
-# Semaphore para limitar concurrencia de PDFs procesándose simultáneamente
 MAX_CONCURRENT_PDFS = 10
 pdf_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PDFS)
 
@@ -230,12 +210,6 @@ class TokenDeleteResponse(BaseModel):
     message: str
 
 
-# Routers
-sgd_router = APIRouter(prefix="/sgd", tags=["SGD"])
-documentos_router = APIRouter(prefix="/documentos", tags=["Documentos"])
-admin_router = APIRouter(prefix="/admin/tokens", tags=["Admin - Gestión de Tokens"])
-
-
 def validar_pdf(file_bytes: bytes) -> bool:
     """Valida que los bytes sean un PDF válido."""
     if not file_bytes.startswith(b'%PDF'):
@@ -272,7 +246,7 @@ def validar_tamano_archivo(file_bytes: bytes) -> None:
     file_size_mb = len(file_bytes) / (1024 * 1024)
     if file_size_mb > settings.MAX_FILE_SIZE_MB:
         raise HTTPException(
-            status_code=413,
+            status_code=HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"Archivo excede el tamaño máximo de {settings.MAX_FILE_SIZE_MB}MB"
         )
 
@@ -539,7 +513,7 @@ def _convertir_imagen_a_pdf_sync(imagen_bytes: bytes, nombre_archivo: str) -> by
 
     except Exception as e:
         raise HTTPException(
-            status_code=400,
+            status_code=HTTP_400_BAD_REQUEST,
             detail=f"Error al convertir imagen a PDF: {str(e)}"
         )
 
@@ -576,7 +550,6 @@ def _convertir_excel_a_pdf_sync(excel_bytes: bytes, nombre_archivo: str) -> byte
             except Exception as e:
                 errores.append(f"xlrd: {str(e)[:100]}")
         else:
-            # Para otras extensiones (.xlsb, .xltx, .xltm)
             try:
                 df_dict = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=None, engine='openpyxl', header=None)
             except Exception as e:
@@ -585,7 +558,7 @@ def _convertir_excel_a_pdf_sync(excel_bytes: bytes, nombre_archivo: str) -> byte
         if not df_dict:
             logger.warning(f"No se pudo leer Excel {nombre_archivo}: {'; '.join(errores)}")
             raise HTTPException(
-                status_code=400,
+                status_code=HTTP_400_BAD_REQUEST,
                 detail=f"Error al leer Excel: {'; '.join(errores)}"
             )
 
@@ -667,7 +640,7 @@ def _convertir_excel_a_pdf_sync(excel_bytes: bytes, nombre_archivo: str) -> byte
         raise
     except Exception as e:
         raise HTTPException(
-            status_code=400,
+            status_code=HTTP_400_BAD_REQUEST,
             detail=f"Error al convertir Excel a PDF: {str(e)}"
         )
 
@@ -700,7 +673,7 @@ async def convertir_excel_a_pdf(excel_bytes: bytes, nombre_archivo: str) -> byte
     except asyncio.TimeoutError:
         logger.error(f"Conversión Excel excedió timeout para {nombre_archivo} ({timeout}s)")
         raise HTTPException(
-            status_code=408,
+            status_code=HTTP_408_REQUEST_TIMEOUT,
             detail=f"Conversión Excel excedió el tiempo límite de {timeout}s"
         )
 
@@ -708,7 +681,7 @@ async def convertir_excel_a_pdf(excel_bytes: bytes, nombre_archivo: str) -> byte
 async def convertir_imagen_a_pdf(imagen_bytes: bytes, nombre_archivo: str) -> bytes:
     """Convierte una imagen a PDF de forma asíncrona."""
     file_size_mb = len(imagen_bytes) / (1024 * 1024)
-    timeout = 60  # 60 segundos para imágenes
+    timeout = 60
 
     logger.info(f"Iniciando conversión imagen a PDF para {nombre_archivo} ({file_size_mb:.2f}MB)")
     start_time = time.time()
@@ -733,7 +706,7 @@ async def convertir_imagen_a_pdf(imagen_bytes: bytes, nombre_archivo: str) -> by
     except asyncio.TimeoutError:
         logger.error(f"Conversión imagen excedió timeout para {nombre_archivo} ({timeout}s)")
         raise HTTPException(
-            status_code=408,
+            status_code=HTTP_408_REQUEST_TIMEOUT,
             detail=f"Conversión imagen excedió el tiempo límite de {timeout}s"
         )
 
@@ -758,17 +731,7 @@ async def verificar_modelo_entrenado(model_id: str) -> bool:
 
 
 async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Extrae datos estructurados de un PDF usando un modelo custom de Azure DI.
-
-    Args:
-        pdf_bytes: Bytes del PDF a analizar
-        model_id: ID del modelo custom a usar
-
-    Returns:
-        Diccionario con los campos extraídos, o None si hubo error
-    """
-    # Los modelos custom están en el contenedor azure-di-custom
+    """Extrae datos estructurados de un PDF usando un modelo custom de Azure DI."""
     url = f"{AZURE_DI_ENDPOINT}/formrecognizer/documentModels/{model_id}:analyze?api-version=2023-07-31"
 
     headers = {
@@ -777,59 +740,42 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
 
     timeout_config = httpx.Timeout(
         connect=settings.TIMEOUT_CONNECT,
-        read=300.0,  # 5 minutos para análisis
+        read=300.0,
         write=settings.TIMEOUT_WRITE,
         pool=5.0
     )
 
     try:
         async with httpx.AsyncClient(timeout=timeout_config) as client:
-            # Iniciar análisis
-            print(f"[DEBUG] POST {url}")
             response = await client.post(url, headers=headers, content=pdf_bytes)
-            print(f"[DEBUG] Respuesta inicial: {response.status_code}")
 
             if response.status_code != 202:
-                print(f"[DEBUG] Error: esperaba 202, recibió {response.status_code}: {response.text}")
                 return None
 
-            # Obtener URL de operación
             operation_location = response.headers.get('Operation-Location')
             if not operation_location:
-                print(f"[DEBUG] Error: no se recibió Operation-Location")
                 return None
 
-            print(f"[DEBUG] Polling en: {operation_location}")
-
-            # Esperar a que termine el análisis (polling)
-            max_intentos = 60  # 5 minutos máximo (60 * 5s)
+            max_intentos = 60
             for intento in range(max_intentos):
                 status_response = await client.get(operation_location)
 
                 if status_response.status_code != 200:
-                    print(f"[DEBUG] Error en polling: {status_response.status_code}")
                     return None
 
                 resultado = status_response.json()
                 status = resultado.get('status')
-                print(f"[DEBUG] Intento {intento+1}: status={status}")
 
                 if status == 'succeeded':
-                    # Extraer datos del resultado
                     analyze_result = resultado.get('analyzeResult', {})
                     documentos = analyze_result.get('documents', [])
-                    print(f"[DEBUG] Análisis exitoso. Documentos encontrados: {len(documentos)}")
 
                     if documentos:
-                        # Retornar los campos del primer documento
                         fields = documentos[0].get('fields', {})
-                        print(f"[DEBUG] Campos extraídos: {len(fields)}")
 
-                        # Simplificar la estructura de los campos
                         datos_extraidos = {}
                         for field_name, field_data in fields.items():
                             if isinstance(field_data, dict):
-                                # Extraer el valor según el tipo
                                 if 'valueString' in field_data:
                                     datos_extraidos[field_name] = field_data['valueString']
                                 elif 'valueNumber' in field_data:
@@ -843,25 +789,17 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
                                 elif 'content' in field_data:
                                     datos_extraidos[field_name] = field_data['content']
 
-                        print(f"[DEBUG] Datos simplificados: {list(datos_extraidos.keys())}")
                         return datos_extraidos
                     return {}
 
                 elif status == 'failed':
-                    error_info = resultado.get('error', {})
-                    print(f"[DEBUG] Análisis falló: {error_info}")
                     return None
 
-                # Esperar 5 segundos antes de verificar de nuevo
                 await asyncio.sleep(5)
 
-            print(f"[DEBUG] Timeout: se excedió el máximo de intentos")
             return None
 
-    except Exception as e:
-        print(f"[DEBUG] Excepción en extraer_datos_con_modelo: {type(e).__name__}: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
         return None
 
 
@@ -881,16 +819,9 @@ def _procesar_calidad_sync(pdf_bytes: bytes) -> tuple:
 
 
 async def clasificar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[str, Any]:
-    """
-    Flujo de clasificación de PDF (sin extracción de datos):
-    1. Análisis y corrección de calidad
-    2. Clasificación de páginas
-    3. Segmentación de documentos
-
-    Retorna documentos finales segmentados con alertas de calidad pero sin extracción de datos.
-    """
+    """Flujo de clasificación de PDF (sin extracción de datos)."""
+    timeout_calidad = 0
     try:
-        # Obtener número de páginas para timeout adaptativo
         pdf_doc_temp = fitz.open(stream=pdf_bytes, filetype="pdf")
         num_paginas = len(pdf_doc_temp)
         pdf_doc_temp.close()
@@ -1005,17 +936,9 @@ async def clasificar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict
 
 
 async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[str, Any]:
-    """
-    Flujo completo de procesamiento de PDF:
-    1. Análisis y corrección de calidad
-    2. Clasificación de páginas
-    3. Segmentación de documentos
-    4. Extracción de datos con modelos custom (si están entrenados)
-
-    Retorna documentos finales segmentados con alertas de calidad y datos extraídos.
-    """
+    """Flujo completo de procesamiento de PDF."""
+    timeout_calidad = 0
     try:
-        # Obtener número de páginas para timeout adaptativo
         pdf_doc_temp = fitz.open(stream=pdf_bytes, filetype="pdf")
         num_paginas = len(pdf_doc_temp)
         pdf_doc_temp.close()
@@ -1097,31 +1020,21 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
 
             nombre_salida = f"{nombre_archivo.replace('.pdf', '')}_{doc_seg['tipo']}_{idx+1}.pdf"
 
-            # Obtener el model_id correspondiente al tipo de documento
             tipo_documento = doc_seg['tipo']
             model_id = DOCUMENT_TYPE_TO_MODEL.get(tipo_documento)
 
-            # Inicializar datos extraídos como None
             datos_extraidos = None
 
-            # Si hay un modelo asociado, intentar extraer datos
             if model_id:
                 try:
-                    # Verificar si el modelo está entrenado
                     modelo_entrenado = await verificar_modelo_entrenado(model_id)
-                    print(f"[DEBUG] Tipo: {tipo_documento}, Model ID: {model_id}, Entrenado: {modelo_entrenado}")
 
                     if modelo_entrenado:
-                        # Extraer datos usando el modelo custom
-                        print(f"[DEBUG] Iniciando extracción para {model_id}...")
                         datos_extraidos = await extraer_datos_con_modelo(
                             doc_seg['pdf_bytes'],
                             model_id
                         )
-                        print(f"[DEBUG] Extracción completada. Datos: {datos_extraidos is not None}")
-                except Exception as e:
-                    # Si hay error en la extracción, continuar sin datos extraídos
-                    print(f"[DEBUG] Error en extracción: {str(e)}")
+                except Exception:
                     datos_extraidos = None
 
             documentos_finales.append({
@@ -1156,14 +1069,14 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
         }
 
 
-@sgd_router.get("/consultar/{codigo_despacho}")
-async def consultar_despacho(codigo_despacho: str, token: str = Depends(verify_api_token)):
-    """
-    Consulta la información del despacho y lista los documentos disponibles.
-    Soporta tanto ID interno como código visible.
-    """
+# SGD Routes
+@get("/consultar/{codigo_despacho:str}")
+async def consultar_despacho(request: Request, codigo_despacho: str) -> dict:
+    """Consulta la información del despacho y lista los documentos disponibles."""
+    verify_api_token(request)
+    
     if not settings.BEARER_TOKEN:
-        raise HTTPException(status_code=500, detail="BEARER_TOKEN no configurado")
+        raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail="BEARER_TOKEN no configurado")
     
     datos_despacho_detalle = await consultar_despacho_detalle(codigo_despacho, settings.BEARER_TOKEN)
     
@@ -1240,22 +1153,16 @@ async def consultar_despacho(codigo_despacho: str, token: str = Depends(verify_a
             "documentos": documentos_info
         }
     
-    raise HTTPException(status_code=404, detail="Despacho no encontrado")
+    raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="Despacho no encontrado")
 
 
-@sgd_router.post("/clasificar/{codigo_despacho}", response_model=ProcesamientoResponse)
-async def clasificar_despacho(codigo_despacho: str, token: str = Depends(verify_api_token)):
-    """
-    Clasifica los documentos del despacho:
-    1. Análisis y corrección de calidad
-    2. Clasificación de páginas
-    3. Segmentación de documentos
-
-    No incluye extracción de datos con modelos.
-    Almacena solo documentos finales segmentados en memoria.
-    """
+@post("/clasificar/{codigo_despacho:str}")
+async def clasificar_despacho(request: Request, codigo_despacho: str) -> ProcesamientoResponse:
+    """Clasifica los documentos del despacho."""
+    verify_api_token(request)
+    
     if not settings.BEARER_TOKEN:
-        raise HTTPException(status_code=500, detail="BEARER_TOKEN no configurado")
+        raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail="BEARER_TOKEN no configurado")
 
     datos_despacho_detalle = await consultar_despacho_detalle(codigo_despacho, settings.BEARER_TOKEN)
 
@@ -1282,7 +1189,7 @@ async def clasificar_despacho(codigo_despacho: str, token: str = Depends(verify_
         documentos_base64_list = await consultar_documentacion(codigo_despacho, settings.BEARER_TOKEN)
 
     if not documentos_base64_list or not isinstance(documentos_base64_list, list):
-        raise HTTPException(status_code=404, detail="No se pudieron obtener los documentos")
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="No se pudieron obtener los documentos")
 
     todos_documentos_finales = []
 
@@ -1356,18 +1263,13 @@ async def clasificar_despacho(codigo_despacho: str, token: str = Depends(verify_
     )
 
 
-@sgd_router.post("/procesar/{codigo_despacho}", response_model=ProcesamientoResponse)
-async def procesar_despacho(codigo_despacho: str, token: str = Depends(verify_api_token)):
-    """
-    Procesa el despacho completo:
-    1. Análisis y corrección de calidad
-    2. Clasificación de páginas
-    3. Segmentación de documentos
-
-    Almacena solo documentos finales segmentados en memoria.
-    """
+@post("/procesar/{codigo_despacho:str}")
+async def procesar_despacho(request: Request, codigo_despacho: str) -> ProcesamientoResponse:
+    """Procesa el despacho completo."""
+    verify_api_token(request)
+    
     if not settings.BEARER_TOKEN:
-        raise HTTPException(status_code=500, detail="BEARER_TOKEN no configurado")
+        raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail="BEARER_TOKEN no configurado")
     
     datos_despacho_detalle = await consultar_despacho_detalle(codigo_despacho, settings.BEARER_TOKEN)
     
@@ -1394,7 +1296,7 @@ async def procesar_despacho(codigo_despacho: str, token: str = Depends(verify_ap
         documentos_base64_list = await consultar_documentacion(codigo_despacho, settings.BEARER_TOKEN)
     
     if not documentos_base64_list or not isinstance(documentos_base64_list, list):
-        raise HTTPException(status_code=404, detail="No se pudieron obtener los documentos")
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="No se pudieron obtener los documentos")
     
     todos_documentos_finales = []
     
@@ -1468,71 +1370,62 @@ async def procesar_despacho(codigo_despacho: str, token: str = Depends(verify_ap
     )
 
 
-@documentos_router.post("/clasificar", response_model=ProcesamientoIndividualResponse)
-async def clasificar_documento_individual(file: UploadFile = File(...), token: str = Depends(verify_api_token)):
-    """
-    Clasifica un documento individual:
-    - Soporta archivos PDF, Excel (.xls, .xlsx, .xlsm, etc.) e imágenes (.jpg, .png, etc.)
-    - Los archivos Excel e imágenes se convierten automáticamente a PDF
-    - Valida el tipo MIME real del archivo
-
-    Flujo:
-    1. Validación de tipo de archivo
-    2. Conversión Excel/imagen a PDF (si aplica)
-    3. Análisis y corrección de calidad
-    4. Clasificación de páginas
-    5. Segmentación de documentos
-
-    No incluye extracción de datos con modelos.
-    Almacena solo documentos finales segmentados en memoria.
-    """
-    nombre_archivo = file.filename.lower()
+# Documentos Routes
+@post("/clasificar")
+async def clasificar_documento_individual(
+    request: Request,
+    data: Annotated[UploadFile, Body(media_type=RequestEncodingType.MULTI_PART)]
+) -> ProcesamientoIndividualResponse:
+    """Clasifica un documento individual."""
+    verify_api_token(request)
+    
+    nombre_archivo = data.filename.lower()
     es_pdf = nombre_archivo.endswith('.pdf')
-    es_excel = es_archivo_excel(file.filename)
-    es_imagen = es_archivo_imagen(file.filename)
+    es_excel = es_archivo_excel(data.filename)
+    es_imagen = es_archivo_imagen(data.filename)
 
     if not es_pdf and not es_excel and not es_imagen:
         raise HTTPException(
-            status_code=400,
+            status_code=HTTP_400_BAD_REQUEST,
             detail="Solo se aceptan archivos PDF, Excel (.xls, .xlsx, .xlsm, .xlsb, .xltx, .xltm) o imágenes (.jpg, .jpeg, .png, .gif, .bmp, .tiff, .webp)"
         )
 
     try:
-        file_bytes = await file.read()
+        file_bytes = await data.read()
 
         validar_tamano_archivo(file_bytes)
 
         if es_excel:
-            if not validar_excel(file_bytes, file.filename):
+            if not validar_excel(file_bytes, data.filename):
                 raise HTTPException(
-                    status_code=400,
+                    status_code=HTTP_400_BAD_REQUEST,
                     detail="El archivo no es un Excel válido"
                 )
-            pdf_bytes = await convertir_excel_a_pdf(file_bytes, file.filename)
-            nombre_procesamiento = file.filename.rsplit('.', 1)[0] + '.pdf'
+            pdf_bytes = await convertir_excel_a_pdf(file_bytes, data.filename)
+            nombre_procesamiento = data.filename.rsplit('.', 1)[0] + '.pdf'
         elif es_imagen:
-            if not validar_imagen(file_bytes, file.filename):
+            if not validar_imagen(file_bytes, data.filename):
                 raise HTTPException(
-                    status_code=400,
+                    status_code=HTTP_400_BAD_REQUEST,
                     detail="El archivo no es una imagen válida"
                 )
-            pdf_bytes = await convertir_imagen_a_pdf(file_bytes, file.filename)
-            nombre_procesamiento = file.filename.rsplit('.', 1)[0] + '.pdf'
+            pdf_bytes = await convertir_imagen_a_pdf(file_bytes, data.filename)
+            nombre_procesamiento = data.filename.rsplit('.', 1)[0] + '.pdf'
         else:
             if not validar_pdf(file_bytes):
                 raise HTTPException(
-                    status_code=400,
+                    status_code=HTTP_400_BAD_REQUEST,
                     detail="El archivo no es un PDF válido"
                 )
             pdf_bytes = file_bytes
-            nombre_procesamiento = file.filename
+            nombre_procesamiento = data.filename
 
         resultado = await clasificar_pdf_completo(pdf_bytes, nombre_procesamiento)
 
         if resultado["error"]:
-            raise HTTPException(status_code=500, detail=f"Error al clasificar: {resultado['error']}")
+            raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al clasificar: {resultado['error']}")
 
-        documentos_finales_individuales[file.filename] = resultado["documentos_finales"]
+        documentos_finales_individuales[data.filename] = resultado["documentos_finales"]
 
         docs_response = []
         for doc_final in resultado["documentos_finales"]:
@@ -1546,80 +1439,71 @@ async def clasificar_documento_individual(file: UploadFile = File(...), token: s
             ))
 
         return ProcesamientoIndividualResponse(
-            archivo_origen=file.filename,
+            archivo_origen=data.filename,
             total_documentos_segmentados=len(docs_response),
             documentos=docs_response
         )
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al clasificar documento: {str(e)}")
+        raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al clasificar documento: {str(e)}")
 
 
-@documentos_router.post("/procesar", response_model=ProcesamientoIndividualResponse)
-async def procesar_documento_individual(file: UploadFile = File(...), token: str = Depends(verify_api_token)):
-    """
-    Procesa un documento individual completo:
-    - Soporta archivos PDF, Excel (.xls, .xlsx, .xlsm, etc.) e imágenes (.jpg, .png, etc.)
-    - Los archivos Excel e imágenes se convierten automáticamente a PDF
-    - Valida el tipo MIME real del archivo
-
-    Flujo:
-    1. Validación de tipo de archivo
-    2. Conversión Excel/imagen a PDF (si aplica)
-    3. Análisis y corrección de calidad
-    4. Clasificación de páginas
-    5. Segmentación de documentos
-
-    Almacena solo documentos finales segmentados en memoria.
-    """
-    nombre_archivo = file.filename.lower()
+@post("/procesar")
+async def procesar_documento_individual(
+    request: Request,
+    data: Annotated[UploadFile, Body(media_type=RequestEncodingType.MULTI_PART)]
+) -> ProcesamientoIndividualResponse:
+    """Procesa un documento individual completo."""
+    verify_api_token(request)
+    
+    nombre_archivo = data.filename.lower()
     es_pdf = nombre_archivo.endswith('.pdf')
-    es_excel = es_archivo_excel(file.filename)
-    es_imagen = es_archivo_imagen(file.filename)
+    es_excel = es_archivo_excel(data.filename)
+    es_imagen = es_archivo_imagen(data.filename)
 
     if not es_pdf and not es_excel and not es_imagen:
         raise HTTPException(
-            status_code=400,
+            status_code=HTTP_400_BAD_REQUEST,
             detail="Solo se aceptan archivos PDF, Excel (.xls, .xlsx, .xlsm, .xlsb, .xltx, .xltm) o imágenes (.jpg, .jpeg, .png, .gif, .bmp, .tiff, .webp)"
         )
 
     try:
-        file_bytes = await file.read()
+        file_bytes = await data.read()
 
         validar_tamano_archivo(file_bytes)
 
         if es_excel:
-            if not validar_excel(file_bytes, file.filename):
+            if not validar_excel(file_bytes, data.filename):
                 raise HTTPException(
-                    status_code=400,
+                    status_code=HTTP_400_BAD_REQUEST,
                     detail="El archivo no es un Excel válido"
                 )
-            pdf_bytes = await convertir_excel_a_pdf(file_bytes, file.filename)
-            nombre_procesamiento = file.filename.rsplit('.', 1)[0] + '.pdf'
+            pdf_bytes = await convertir_excel_a_pdf(file_bytes, data.filename)
+            nombre_procesamiento = data.filename.rsplit('.', 1)[0] + '.pdf'
         elif es_imagen:
-            if not validar_imagen(file_bytes, file.filename):
+            if not validar_imagen(file_bytes, data.filename):
                 raise HTTPException(
-                    status_code=400,
+                    status_code=HTTP_400_BAD_REQUEST,
                     detail="El archivo no es una imagen válida"
                 )
-            pdf_bytes = await convertir_imagen_a_pdf(file_bytes, file.filename)
-            nombre_procesamiento = file.filename.rsplit('.', 1)[0] + '.pdf'
+            pdf_bytes = await convertir_imagen_a_pdf(file_bytes, data.filename)
+            nombre_procesamiento = data.filename.rsplit('.', 1)[0] + '.pdf'
         else:
             if not validar_pdf(file_bytes):
                 raise HTTPException(
-                    status_code=400,
+                    status_code=HTTP_400_BAD_REQUEST,
                     detail="El archivo no es un PDF válido"
                 )
             pdf_bytes = file_bytes
-            nombre_procesamiento = file.filename
+            nombre_procesamiento = data.filename
 
         resultado = await procesar_pdf_completo(pdf_bytes, nombre_procesamiento)
         
         if resultado["error"]:
-            raise HTTPException(status_code=500, detail=f"Error al procesar: {resultado['error']}")
+            raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al procesar: {resultado['error']}")
         
-        documentos_finales_individuales[file.filename] = resultado["documentos_finales"]
+        documentos_finales_individuales[data.filename] = resultado["documentos_finales"]
         
         docs_response = []
         for doc_final in resultado["documentos_finales"]:
@@ -1633,39 +1517,26 @@ async def procesar_documento_individual(file: UploadFile = File(...), token: str
             ))
 
         return ProcesamientoIndividualResponse(
-            archivo_origen=file.filename,
+            archivo_origen=data.filename,
             total_documentos_segmentados=len(docs_response),
             documentos=docs_response
         )
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al procesar documento: {str(e)}")
+        raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al procesar documento: {str(e)}")
 
 
-# ============================================
-# ADMIN ENDPOINTS - Gestión de Tokens
-# ============================================
-
-@admin_router.get("/", response_model=List[TokenInfo])
-async def listar_tokens(admin_token: str = Depends(verify_admin_token)):
-    """
-    Lista todos los tokens de la API con su metadata.
-
-    **Requiere token de administrador.**
-
-    - Muestra tokens enmascarados por seguridad
-    - Incluye fecha de creación y último uso
-    - Muestra estado activo/inactivo
-    - Incluye tokens del gestor (tokens.json) y tokens legacy (.env)
-    """
-    # Tokens del gestor (tokens.json)
+# Admin Routes
+@get("/")
+async def listar_tokens(request: Request) -> List[TokenInfo]:
+    """Lista todos los tokens de la API con su metadata."""
+    verify_admin_token(request)
+    
     tokens = token_manager.list_tokens()
 
-    # Agregar tokens del .env (API_TOKENS)
     env_tokens = get_valid_api_tokens()
     for idx, token_value in enumerate(env_tokens, start=1):
-        # Enmascarar token
         masked_token = f"{token_value[:8]}...{token_value[-4:]}" if len(token_value) > 12 else "***"
 
         tokens.append({
@@ -1678,45 +1549,26 @@ async def listar_tokens(admin_token: str = Depends(verify_admin_token)):
             "is_active": True
         })
 
-    return tokens
+    return [TokenInfo(**t) for t in tokens]
 
 
-@admin_router.post("/generate", response_model=TokenCreateResponse)
-async def generar_token(
-    request: TokenCreateRequest,
-    admin_token: str = Depends(verify_admin_token)
-):
-    """
-    Genera un nuevo token de autenticación API.
-
-    **Requiere token de administrador.**
-
-    - **name**: Nombre descriptivo del token o usuario
-
-    **IMPORTANTE**: El token completo solo se muestra una vez.
-    Guárdalo en un lugar seguro.
-    """
+@post("/generate")
+async def generar_token(request: Request, data: TokenCreateRequest) -> TokenCreateResponse:
+    """Genera un nuevo token de autenticación API."""
+    verify_admin_token(request)
+    
     result = token_manager.generate_token(
-        name=request.name,
+        name=data.name,
         created_by="admin"
     )
-    return result
+    return TokenCreateResponse(**result)
 
 
-@admin_router.delete("/{token_id}", response_model=TokenDeleteResponse)
-async def eliminar_token(
-    token_id: str,
-    admin_token: str = Depends(verify_admin_token)
-):
-    """
-    Elimina un token por su ID.
-
-    **Requiere token de administrador.**
-
-    - **token_id**: ID del token a eliminar (obtenido desde listar_tokens)
-
-    El token eliminado dejará de funcionar inmediatamente.
-    """
+@delete("/{token_id:str}", status_code=HTTP_200_OK)
+async def eliminar_token(request: Request, token_id: str) -> TokenDeleteResponse:
+    """Elimina un token por su ID."""
+    verify_admin_token(request)
+    
     success = token_manager.delete_token(token_id)
 
     if success:
@@ -1726,17 +1578,59 @@ async def eliminar_token(
         )
     else:
         raise HTTPException(
-            status_code=404,
+            status_code=HTTP_404_NOT_FOUND,
             detail=f"Token {token_id} no encontrado"
         )
 
 
-app.include_router(sgd_router)
-app.include_router(documentos_router)
-app.include_router(modelos_router)
-app.include_router(admin_router)
-
-
-@app.get("/")
-async def root():
+@get("/")
+async def root() -> dict:
     return {"status": "online", "service": "API Docs"}
+
+
+# Import modelos router
+from modelos import modelos_router
+
+# Crear Routers con prefijos y tags
+sgd_router = Router(
+    path="/sgd",
+    route_handlers=[consultar_despacho, clasificar_despacho, procesar_despacho],
+    tags=["SGD"]
+)
+
+documentos_router = Router(
+    path="/documentos",
+    route_handlers=[clasificar_documento_individual, procesar_documento_individual],
+    tags=["Documentos"]
+)
+
+admin_router = Router(
+    path="/admin/tokens",
+    route_handlers=[listar_tokens, generar_token, eliminar_token],
+    tags=["Admin - Gestión de Tokens"]
+)
+
+app = Litestar(
+    route_handlers=[
+        root,
+        sgd_router,
+        documentos_router,
+        admin_router,
+        modelos_router,
+    ],
+    openapi_config=OpenAPIConfig(
+        title="API Docs",
+        version="1.0.0",
+        components=Components(
+            security_schemes={
+                "BearerAuth": SecurityScheme(
+                    type="http",
+                    scheme="bearer",
+                    bearer_format="JWT",
+                    description="Token de autenticación API"
+                )
+            }
+        ),
+        security=[{"BearerAuth": []}]
+    ),
+)

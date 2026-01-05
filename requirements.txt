@@ -1,4 +1,4 @@
-fastapi
+litestar[standard]
 uvicorn
 requests
 httpx
