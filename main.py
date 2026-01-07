@@ -107,17 +107,20 @@ BASE_URL = "https://backend.juanleon.cl"
 ENDPOINT_DESPACHO = "/api/admin/despachos/{codigo}"
 ENDPOINT_DOCUMENTOS = "/api/admin/documentos64/despacho/{codigo_visible}"
 
-AZURE_DI_ENDPOINT = "http://azure-di-custom:5000"
-API_VERSION = "2022-08-31"
-API_VERSION_ANALYZE = "2024-11-30"
+# Azure Document Intelligence - Cloud
+API_VERSION = "2024-11-30"
 
+# Modelo custom en Azure Cloud
+CUSTOM_MODEL_ID = "master-01-alpha"
+
+# Mapeo de tipos de documento al modelo (todos usan el mismo modelo master)
 DOCUMENT_TYPE_TO_MODEL = {
-    "FACTURA_COMERCIAL": "invoice",
-    "DOCUMENTO_TRANSPORTE": "transport",
-    "CERTIFICADO_ORIGEN": "origin",
-    "LISTA_EMBALAJE": "packing-list",
-    "CERTIFICADO_SANITARIO": "health",
-    "POLIZA_SEGURO": "insurance",
+    "FACTURA_COMERCIAL": CUSTOM_MODEL_ID,
+    "DOCUMENTO_TRANSPORTE": CUSTOM_MODEL_ID,
+    "CERTIFICADO_ORIGEN": CUSTOM_MODEL_ID,
+    "LISTA_EMBALAJE": CUSTOM_MODEL_ID,
+    "CERTIFICADO_SANITARIO": CUSTOM_MODEL_ID,
+    "POLIZA_SEGURO": CUSTOM_MODEL_ID,
     "UNKNOWN_DOCUMENT": None
 }
 
@@ -711,9 +714,96 @@ async def convertir_imagen_a_pdf(imagen_bytes: bytes, nombre_archivo: str) -> by
         )
 
 
+def get_azure_headers() -> Dict[str, str]:
+    """Retorna headers para autenticación con Azure DI Cloud."""
+    return {
+        "Ocp-Apim-Subscription-Key": settings.AZURE_KEY,
+        "Content-Type": "application/pdf"
+    }
+
+
+def get_azure_base_url() -> str:
+    """Retorna la URL base de Azure DI."""
+    endpoint = settings.AZURE_ENDPOINT.rstrip('/')
+    return f"{endpoint}/documentintelligence"
+
+
+def limpiar_datos_azure(data: Any) -> Any:
+    """
+    Limpia recursivamente la respuesta de Azure DI para eliminar metadata
+    (polygons, spans, confidence) y dejar solo los valores.
+    """
+    if isinstance(data, list):
+        return [limpiar_datos_azure(item) for item in data]
+    
+    if isinstance(data, dict):
+        # 1. Prioridad: Valores directos extraídos
+        if "valueString" in data: return data["valueString"]
+        if "valueNumber" in data: return data["valueNumber"]
+        if "valueDate" in data: return data["valueDate"]
+        if "valueTime" in data: return data["valueTime"]
+        if "valuePhoneNumber" in data: return data["valuePhoneNumber"]
+        if "valueBoolean" in data: return data["valueBoolean"]
+        if "valueSelectionMark" in data: return data["valueSelectionMark"]
+        
+        # 2. Estructuras complejas (Arrays y Objetos)
+        if "valueArray" in data:
+            return limpiar_datos_azure(data["valueArray"])
+        if "valueObject" in data:
+            return {k: limpiar_datos_azure(v) for k, v in data["valueObject"].items()}
+        
+        # 3. Limpieza general (para diccionarios contenedores o fallbacks)
+        cleaned = {}
+        for k, v in data.items():
+            # Ignorar metadatos técnicos de Azure
+            if k in ["boundingRegions", "polygon", "spans", "confidence", "type"]:
+                continue
+            cleaned[k] = limpiar_datos_azure(v)
+        
+        # 4. Caso borde: Si después de limpiar no queda nada estructurado,
+        # pero existe 'content' (el texto OCR crudo), devolver eso.
+        # Esto sirve cuando Azure detecta el campo pero no interpreta el tipo de valor.
+        if not cleaned and "content" in data:
+            return data["content"]
+            
+        return cleaned
+
+    return data
+
+
+def eliminar_campos_vacios(data: Any) -> Any:
+    """
+    Elimina recursivamente claves con valores None, {}, [] o strings vacíos.
+    """
+    if isinstance(data, dict):
+        # 1. Limpiar recursivamente cada valor del diccionario
+        cleaned = {
+            k: eliminar_campos_vacios(v)
+            for k, v in data.items()
+        }
+        # 2. Retornar solo las claves que NO quedaron vacías
+        return {
+            k: v for k, v in cleaned.items() 
+            if v not in [None, {}, [], ""]
+        }
+    
+    elif isinstance(data, list):
+        # 1. Limpiar recursivamente cada elemento de la lista
+        cleaned = [eliminar_campos_vacios(item) for item in data]
+        # 2. Retornar solo los elementos que NO quedaron vacíos
+        return [item for item in cleaned if item not in [None, {}, [], ""]]
+        
+    return data
+
+
 async def verificar_modelo_entrenado(model_id: str) -> bool:
-    """Verifica si un modelo custom está entrenado en Azure DI."""
-    url = f"{AZURE_DI_ENDPOINT}/formrecognizer/documentModels/{model_id}?api-version={API_VERSION}"
+    """Verifica si un modelo custom está entrenado en Azure DI Cloud."""
+    base_url = get_azure_base_url()
+    url = f"{base_url}/documentModels/{model_id}?api-version={API_VERSION}"
+
+    headers = {
+        "Ocp-Apim-Subscription-Key": settings.AZURE_KEY
+    }
 
     timeout_config = httpx.Timeout(
         connect=settings.TIMEOUT_CONNECT,
@@ -724,19 +814,24 @@ async def verificar_modelo_entrenado(model_id: str) -> bool:
 
     try:
         async with httpx.AsyncClient(timeout=timeout_config) as client:
-            response = await client.get(url)
-            return response.status_code == 200
-    except Exception:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                logger.info(f"Modelo {model_id} verificado en Azure Cloud")
+                return True
+            else:
+                logger.warning(f"Modelo {model_id} no encontrado: {response.status_code}")
+                return False
+    except Exception as e:
+        logger.error(f"Error verificando modelo {model_id}: {str(e)}")
         return False
 
 
 async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[Dict[str, Any]]:
-    """Extrae datos estructurados de un PDF usando un modelo custom de Azure DI."""
-    url = f"{AZURE_DI_ENDPOINT}/formrecognizer/documentModels/{model_id}:analyze?api-version=2023-07-31"
+    """Extrae datos estructurados de un PDF usando un modelo custom de Azure DI Cloud."""
+    base_url = get_azure_base_url()
+    url = f"{base_url}/documentModels/{model_id}:analyze?api-version={API_VERSION}"
 
-    headers = {
-        "Content-Type": "application/pdf"
-    }
+    headers = get_azure_headers()
 
     timeout_config = httpx.Timeout(
         connect=settings.TIMEOUT_CONNECT,
@@ -747,20 +842,31 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
 
     try:
         async with httpx.AsyncClient(timeout=timeout_config) as client:
+            logger.info(f"Enviando documento a modelo {model_id} en Azure Cloud")
             response = await client.post(url, headers=headers, content=pdf_bytes)
 
             if response.status_code != 202:
+                logger.warning(f"Error iniciando análisis: {response.status_code} - {response.text[:500]}")
                 return None
 
             operation_location = response.headers.get('Operation-Location')
             if not operation_location:
+                logger.warning("No se recibió Operation-Location")
                 return None
+
+            logger.info(f"Análisis iniciado, polling: {operation_location}")
+
+            # Headers para polling (sin Content-Type)
+            poll_headers = {
+                "Ocp-Apim-Subscription-Key": settings.AZURE_KEY
+            }
 
             max_intentos = 60
             for intento in range(max_intentos):
-                status_response = await client.get(operation_location)
+                status_response = await client.get(operation_location, headers=poll_headers)
 
                 if status_response.status_code != 200:
+                    logger.warning(f"Error en polling: {status_response.status_code}")
                     return None
 
                 resultado = status_response.json()
@@ -769,37 +875,36 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
                 if status == 'succeeded':
                     analyze_result = resultado.get('analyzeResult', {})
                     documentos = analyze_result.get('documents', [])
+                    
+                    logger.info(f"Análisis exitoso. Documentos encontrados: {len(documentos)}")
 
                     if documentos:
                         fields = documentos[0].get('fields', {})
+                        logger.info(f"Campos extraídos: {list(fields.keys())}")
 
-                        datos_extraidos = {}
-                        for field_name, field_data in fields.items():
-                            if isinstance(field_data, dict):
-                                if 'valueString' in field_data:
-                                    datos_extraidos[field_name] = field_data['valueString']
-                                elif 'valueNumber' in field_data:
-                                    datos_extraidos[field_name] = field_data['valueNumber']
-                                elif 'valueDate' in field_data:
-                                    datos_extraidos[field_name] = field_data['valueDate']
-                                elif 'valueArray' in field_data:
-                                    datos_extraidos[field_name] = field_data['valueArray']
-                                elif 'valueObject' in field_data:
-                                    datos_extraidos[field_name] = field_data['valueObject']
-                                elif 'content' in field_data:
-                                    datos_extraidos[field_name] = field_data['content']
+                        # 1. Aplanar estructura de Azure
+                        datos_aplanados = {
+                            k: limpiar_datos_azure(v) for k, v in fields.items()
+                        }
 
-                        return datos_extraidos
+                        # 2. Eliminar campos vacíos o nulos
+                        datos_finales = eliminar_campos_vacios(datos_aplanados)
+
+                        return datos_finales
                     return {}
 
                 elif status == 'failed':
+                    error = resultado.get('error', {})
+                    logger.error(f"Análisis fallido: {error}")
                     return None
 
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
 
+            logger.warning("Timeout en análisis")
             return None
 
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error en extracción: {str(e)}")
         return None
 
 
@@ -1034,7 +1139,8 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
                             doc_seg['pdf_bytes'],
                             model_id
                         )
-                except Exception:
+                except Exception as e:
+                    logger.error(f"Error extrayendo datos: {str(e)}")
                     datos_extraidos = None
 
             documentos_finales.append({
@@ -1244,13 +1350,18 @@ async def clasificar_despacho(request: Request, codigo_despacho: str) -> Procesa
 
     docs_response = []
     for doc_final in todos_documentos_finales:
+        # Aplicamos limpieza a los datos extraídos si existen
+        datos_limpios = None
+        if doc_final.get("datos_extraidos"):
+             datos_limpios = eliminar_campos_vacios(doc_final.get("datos_extraidos"))
+
         docs_response.append(DocumentoFinal(
             archivo_origen=doc_final["archivo_origen"],
             nombre_salida=doc_final["nombre_salida"],
             tipo=doc_final["tipo"],
             paginas=doc_final["paginas"],
             alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None,
-            datos_extraidos=doc_final.get("datos_extraidos")
+            datos_extraidos=datos_limpios
         ))
 
     return ProcesamientoResponse(
@@ -1351,13 +1462,18 @@ async def procesar_despacho(request: Request, codigo_despacho: str) -> Procesami
     
     docs_response = []
     for doc_final in todos_documentos_finales:
+        # Aplicamos limpieza a los datos extraídos si existen
+        datos_limpios = None
+        if doc_final.get("datos_extraidos"):
+             datos_limpios = eliminar_campos_vacios(doc_final.get("datos_extraidos"))
+
         docs_response.append(DocumentoFinal(
             archivo_origen=doc_final["archivo_origen"],
             nombre_salida=doc_final["nombre_salida"],
             tipo=doc_final["tipo"],
             paginas=doc_final["paginas"],
             alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None,
-            datos_extraidos=doc_final.get("datos_extraidos")
+            datos_extraidos=datos_limpios
         ))
 
     return ProcesamientoResponse(
@@ -1429,13 +1545,18 @@ async def clasificar_documento_individual(
 
         docs_response = []
         for doc_final in resultado["documentos_finales"]:
+            # Aplicamos limpieza a los datos extraídos si existen
+            datos_limpios = None
+            if doc_final.get("datos_extraidos"):
+                datos_limpios = eliminar_campos_vacios(doc_final.get("datos_extraidos"))
+
             docs_response.append(DocumentoFinal(
                 archivo_origen=doc_final["archivo_origen"],
                 nombre_salida=doc_final["nombre_salida"],
                 tipo=doc_final["tipo"],
                 paginas=doc_final["paginas"],
                 alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None,
-                datos_extraidos=doc_final.get("datos_extraidos")
+                datos_extraidos=datos_limpios
             ))
 
         return ProcesamientoIndividualResponse(
@@ -1507,13 +1628,18 @@ async def procesar_documento_individual(
         
         docs_response = []
         for doc_final in resultado["documentos_finales"]:
+            # Aplicamos limpieza a los datos extraídos si existen
+            datos_limpios = None
+            if doc_final.get("datos_extraidos"):
+                datos_limpios = eliminar_campos_vacios(doc_final.get("datos_extraidos"))
+
             docs_response.append(DocumentoFinal(
                 archivo_origen=doc_final["archivo_origen"],
                 nombre_salida=doc_final["nombre_salida"],
                 tipo=doc_final["tipo"],
                 paginas=doc_final["paginas"],
                 alertas=[Alerta(**alerta) for alerta in doc_final["alertas"]] if doc_final["alertas"] else None,
-                datos_extraidos=doc_final.get("datos_extraidos")
+                datos_extraidos=datos_limpios
             ))
 
         return ProcesamientoIndividualResponse(
@@ -1585,11 +1711,8 @@ async def eliminar_token(request: Request, token_id: str) -> TokenDeleteResponse
 
 @get("/")
 async def root() -> dict:
-    return {"status": "online", "service": "API Docs"}
+    return {"status": "online", "service": "API Docs", "azure_di": "cloud"}
 
-
-# Import modelos router
-from modelos import modelos_router
 
 # Crear Routers con prefijos y tags
 sgd_router = Router(
@@ -1616,11 +1739,10 @@ app = Litestar(
         sgd_router,
         documentos_router,
         admin_router,
-        modelos_router,
     ],
     openapi_config=OpenAPIConfig(
         title="API Docs",
-        version="1.0.0",
+        version="2.0.0",
         components=Components(
             security_schemes={
                 "BearerAuth": SecurityScheme(
@@ -1633,4 +1755,5 @@ app = Litestar(
         ),
         security=[{"BearerAuth": []}]
     ),
+    request_max_body_size=500 * 1024 * 1024,  # 500MB
 )

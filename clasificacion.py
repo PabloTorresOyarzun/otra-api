@@ -9,6 +9,15 @@ import re
 
 settings = get_settings()
 
+# Azure Document Intelligence - Cloud
+API_VERSION = "2024-11-30"
+
+
+def get_azure_base_url() -> str:
+    """Retorna la URL base de Azure DI."""
+    endpoint = settings.AZURE_ENDPOINT.rstrip('/')
+    return f"{endpoint}/documentintelligence"
+
 
 def recortar_header(pdf_bytes: bytes) -> bytes:
     """Recorta el 35% superior de cada página del PDF."""
@@ -29,11 +38,10 @@ def recortar_header(pdf_bytes: bytes) -> bytes:
 
 
 async def extraer_texto_documento_completo(
-    pdf_bytes: bytes, 
-    azure_endpoint: str = "http://azure-di-layout:5000"
+    pdf_bytes: bytes
 ) -> Tuple[Dict[int, str], str]:
     """
-    Extrae texto de TODAS las páginas de un PDF usando Azure Document Intelligence.
+    Extrae texto de TODAS las páginas de un PDF usando Azure Document Intelligence Cloud.
     Retorna (dict_paginas, estado) donde:
     - dict_paginas: {numero_pagina: texto_extraido}
     - estado: indicador de éxito o error
@@ -47,9 +55,11 @@ async def extraer_texto_documento_completo(
         timeout_total = calcular_timeout_azure(num_paginas)
         max_attempts = int(timeout_total / 2)  # Poll cada 2 segundos
         
-        url = f"{azure_endpoint}/documentintelligence/documentModels/prebuilt-layout:analyze?api-version=2024-11-30"
+        base_url = get_azure_base_url()
+        url = f"{base_url}/documentModels/prebuilt-layout:analyze?api-version={API_VERSION}"
         
         headers = {
+            "Ocp-Apim-Subscription-Key": settings.AZURE_KEY,
             "Content-Type": "application/pdf"
         }
         
@@ -62,18 +72,25 @@ async def extraer_texto_documento_completo(
         
         async with httpx.AsyncClient(timeout=timeout_config) as client:
             response = await client.post(url, headers=headers, content=pdf_bytes)
-            response.raise_for_status()
+            
+            if response.status_code != 202:
+                return {}, f"error_status_{response.status_code}"
             
             operation_location = response.headers.get("Operation-Location")
             if not operation_location:
                 return {}, "error_no_operation_location"
+            
+            # Headers para polling (sin Content-Type)
+            poll_headers = {
+                "Ocp-Apim-Subscription-Key": settings.AZURE_KEY
+            }
             
             # Polling con backoff exponencial
             for attempt in range(max_attempts):
                 wait_time = min(1 * (1.5 ** attempt), 5)  # Max 5s entre polls
                 await asyncio.sleep(wait_time)
                 
-                result_response = await client.get(operation_location)
+                result_response = await client.get(operation_location, headers=poll_headers)
                 result_data = result_response.json()
                 
                 if result_data.get("status") == "succeeded":
