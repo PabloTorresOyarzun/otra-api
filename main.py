@@ -36,6 +36,7 @@ from quality import paso_1_analizar_documento, paso_2_corregir_rotacion
 from clasificacion import clasificar_documento_completo, segmentar_pdf
 from config import get_settings, calcular_timeout_excel, calcular_timeout_calidad, get_valid_api_tokens
 from token_manager import token_manager
+from database import db_manager, cache_repo, calcular_hash_documentos, calcular_hash_archivo
 
 
 @contextmanager
@@ -134,6 +135,7 @@ MAX_CONCURRENT_PDFS = 10
 pdf_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PDFS)
 
 
+# Pydantic Models
 class DocumentoSimplificado(BaseModel):
     nombre: str
     estado: str
@@ -171,6 +173,13 @@ class DocumentoFinal(BaseModel):
     datos_extraidos: Optional[Dict[str, Any]] = None
 
 
+class CacheInfo(BaseModel):
+    desde_cache: bool
+    hash_documentos: Optional[str] = None
+    fecha_cache: Optional[str] = None
+    hay_cambios: Optional[bool] = None
+
+
 class ProcesamientoResponse(BaseModel):
     codigo_despacho: str
     cliente: str
@@ -178,12 +187,14 @@ class ProcesamientoResponse(BaseModel):
     tipo: str
     total_documentos_segmentados: int
     documentos: List[DocumentoFinal]
+    cache_info: Optional[CacheInfo] = None
 
 
 class ProcesamientoIndividualResponse(BaseModel):
     archivo_origen: str
     total_documentos_segmentados: int
     documentos: List[DocumentoFinal]
+    cache_info: Optional[CacheInfo] = None
 
 
 class TokenInfo(BaseModel):
@@ -737,7 +748,6 @@ def limpiar_datos_azure(data: Any) -> Any:
         return [limpiar_datos_azure(item) for item in data]
     
     if isinstance(data, dict):
-        # 1. Prioridad: Valores directos extraídos
         if "valueString" in data: return data["valueString"]
         if "valueNumber" in data: return data["valueNumber"]
         if "valueDate" in data: return data["valueDate"]
@@ -746,23 +756,17 @@ def limpiar_datos_azure(data: Any) -> Any:
         if "valueBoolean" in data: return data["valueBoolean"]
         if "valueSelectionMark" in data: return data["valueSelectionMark"]
         
-        # 2. Estructuras complejas (Arrays y Objetos)
         if "valueArray" in data:
             return limpiar_datos_azure(data["valueArray"])
         if "valueObject" in data:
             return {k: limpiar_datos_azure(v) for k, v in data["valueObject"].items()}
         
-        # 3. Limpieza general (para diccionarios contenedores o fallbacks)
         cleaned = {}
         for k, v in data.items():
-            # Ignorar metadatos técnicos de Azure
             if k in ["boundingRegions", "polygon", "spans", "confidence", "type"]:
                 continue
             cleaned[k] = limpiar_datos_azure(v)
         
-        # 4. Caso borde: Si después de limpiar no queda nada estructurado,
-        # pero existe 'content' (el texto OCR crudo), devolver eso.
-        # Esto sirve cuando Azure detecta el campo pero no interpreta el tipo de valor.
         if not cleaned and "content" in data:
             return data["content"]
             
@@ -776,21 +780,17 @@ def eliminar_campos_vacios(data: Any) -> Any:
     Elimina recursivamente claves con valores None, {}, [] o strings vacíos.
     """
     if isinstance(data, dict):
-        # 1. Limpiar recursivamente cada valor del diccionario
         cleaned = {
             k: eliminar_campos_vacios(v)
             for k, v in data.items()
         }
-        # 2. Retornar solo las claves que NO quedaron vacías
         return {
             k: v for k, v in cleaned.items() 
             if v not in [None, {}, [], ""]
         }
     
     elif isinstance(data, list):
-        # 1. Limpiar recursivamente cada elemento de la lista
         cleaned = [eliminar_campos_vacios(item) for item in data]
-        # 2. Retornar solo los elementos que NO quedaron vacíos
         return [item for item in cleaned if item not in [None, {}, [], ""]]
         
     return data
@@ -856,7 +856,6 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
 
             logger.info(f"Análisis iniciado, polling: {operation_location}")
 
-            # Headers para polling (sin Content-Type)
             poll_headers = {
                 "Ocp-Apim-Subscription-Key": settings.AZURE_KEY
             }
@@ -882,12 +881,10 @@ async def extraer_datos_con_modelo(pdf_bytes: bytes, model_id: str) -> Optional[
                         fields = documentos[0].get('fields', {})
                         logger.info(f"Campos extraídos: {list(fields.keys())}")
 
-                        # 1. Aplanar estructura de Azure
                         datos_aplanados = {
                             k: limpiar_datos_azure(v) for k, v in fields.items()
                         }
 
-                        # 2. Eliminar campos vacíos o nulos
                         datos_finales = eliminar_campos_vacios(datos_aplanados)
 
                         return datos_finales
@@ -1175,6 +1172,21 @@ async def procesar_pdf_completo(pdf_bytes: bytes, nombre_archivo: str) -> Dict[s
         }
 
 
+def serializar_documentos_para_cache(documentos: List[Dict]) -> List[Dict]:
+    """Prepara documentos para almacenamiento en caché (sin pdf_bytes)."""
+    return [
+        {
+            "archivo_origen": doc["archivo_origen"],
+            "nombre_salida": doc["nombre_salida"],
+            "tipo": doc["tipo"],
+            "paginas": doc["paginas"],
+            "alertas": doc.get("alertas"),
+            "datos_extraidos": doc.get("datos_extraidos")
+        }
+        for doc in documentos
+    ]
+
+
 # SGD Routes
 @get("/consultar/{codigo_despacho:str}")
 async def consultar_despacho(request: Request, codigo_despacho: str) -> dict:
@@ -1263,8 +1275,18 @@ async def consultar_despacho(request: Request, codigo_despacho: str) -> dict:
 
 
 @post("/clasificar/{codigo_despacho:str}")
-async def clasificar_despacho(request: Request, codigo_despacho: str) -> ProcesamientoResponse:
-    """Clasifica los documentos del despacho."""
+async def clasificar_despacho(
+    request: Request, 
+    codigo_despacho: str,
+    force: bool = False
+) -> ProcesamientoResponse:
+    """
+    Clasifica los documentos del despacho.
+    
+    Args:
+        codigo_despacho: Código del despacho a clasificar
+        force: Si es True, fuerza el reprocesamiento ignorando el caché
+    """
     verify_api_token(request)
     
     if not settings.BEARER_TOKEN:
@@ -1297,6 +1319,53 @@ async def clasificar_despacho(request: Request, codigo_despacho: str) -> Procesa
     if not documentos_base64_list or not isinstance(documentos_base64_list, list):
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="No se pudieron obtener los documentos")
 
+    # Calcular hash de documentos actuales
+    documentos_hash = calcular_hash_documentos(documentos_base64_list)
+
+    # Verificar caché si está habilitado y no se fuerza reprocesamiento
+    cache_info = None
+    if settings.CACHE_ENABLED and not force:
+        try:
+            estado_cache = await cache_repo.verificar_cambios_despacho(
+                codigo_despacho, "clasificar", documentos_hash
+            )
+            
+            if estado_cache["existe_cache"] and not estado_cache["hay_cambios"]:
+                # Retornar desde caché
+                cached = await cache_repo.obtener_despacho(
+                    codigo_despacho, "clasificar", documentos_hash
+                )
+                if cached:
+                    logger.info(f"Retornando clasificación desde caché para {codigo_despacho}")
+                    docs_response = [
+                        DocumentoFinal(**doc) for doc in cached["resultado"]["documentos"]
+                    ]
+                    return ProcesamientoResponse(
+                        codigo_despacho=codigo_despacho,
+                        cliente=cached["cliente"],
+                        estado=cached["estado"],
+                        tipo=cached["tipo"],
+                        total_documentos_segmentados=cached["total_documentos_segmentados"],
+                        documentos=docs_response,
+                        cache_info=CacheInfo(
+                            desde_cache=True,
+                            hash_documentos=documentos_hash,
+                            fecha_cache=str(cached["updated_at"]),
+                            hay_cambios=False
+                        )
+                    )
+            
+            # Hay cambios o no existe caché
+            cache_info = CacheInfo(
+                desde_cache=False,
+                hash_documentos=documentos_hash,
+                hay_cambios=estado_cache.get("hay_cambios", True)
+            )
+        except Exception as e:
+            logger.warning(f"Error consultando caché: {e}")
+            cache_info = CacheInfo(desde_cache=False, hash_documentos=documentos_hash)
+
+    # Procesar documentos
     todos_documentos_finales = []
 
     for doc in documentos_base64_list:
@@ -1350,7 +1419,6 @@ async def clasificar_despacho(request: Request, codigo_despacho: str) -> Procesa
 
     docs_response = []
     for doc_final in todos_documentos_finales:
-        # Aplicamos limpieza a los datos extraídos si existen
         datos_limpios = None
         if doc_final.get("datos_extraidos"):
              datos_limpios = eliminar_campos_vacios(doc_final.get("datos_extraidos"))
@@ -1364,19 +1432,46 @@ async def clasificar_despacho(request: Request, codigo_despacho: str) -> Procesa
             datos_extraidos=datos_limpios
         ))
 
+    # Guardar en caché
+    if settings.CACHE_ENABLED:
+        try:
+            await cache_repo.guardar_despacho(
+                codigo_despacho=codigo_despacho,
+                tipo_operacion="clasificar",
+                documentos_hash=documentos_hash,
+                cliente=cliente_nombre,
+                estado=estado_despacho,
+                tipo=tipo_despacho,
+                total_documentos_segmentados=len(docs_response),
+                resultado={"documentos": [doc.model_dump() for doc in docs_response]}
+            )
+        except Exception as e:
+            logger.warning(f"Error guardando en caché: {e}")
+
     return ProcesamientoResponse(
         codigo_despacho=codigo_despacho,
         cliente=cliente_nombre,
         estado=estado_despacho,
         tipo=tipo_despacho,
         total_documentos_segmentados=len(docs_response),
-        documentos=docs_response
+        documentos=docs_response,
+        cache_info=cache_info
     )
 
 
 @post("/procesar/{codigo_despacho:str}")
-async def procesar_despacho(request: Request, codigo_despacho: str) -> ProcesamientoResponse:
-    """Procesa el despacho completo."""
+async def procesar_despacho(
+    request: Request, 
+    codigo_despacho: str,
+    force: bool = False
+) -> ProcesamientoResponse:
+    """
+    Procesa el despacho completo (clasificación + extracción de datos).
+    
+    Args:
+        codigo_despacho: Código del despacho a procesar
+        force: Si es True, fuerza el reprocesamiento ignorando el caché
+    """
     verify_api_token(request)
     
     if not settings.BEARER_TOKEN:
@@ -1409,6 +1504,50 @@ async def procesar_despacho(request: Request, codigo_despacho: str) -> Procesami
     if not documentos_base64_list or not isinstance(documentos_base64_list, list):
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="No se pudieron obtener los documentos")
     
+    # Calcular hash de documentos actuales
+    documentos_hash = calcular_hash_documentos(documentos_base64_list)
+
+    # Verificar caché si está habilitado y no se fuerza reprocesamiento
+    cache_info = None
+    if settings.CACHE_ENABLED and not force:
+        try:
+            estado_cache = await cache_repo.verificar_cambios_despacho(
+                codigo_despacho, "procesar", documentos_hash
+            )
+            
+            if estado_cache["existe_cache"] and not estado_cache["hay_cambios"]:
+                cached = await cache_repo.obtener_despacho(
+                    codigo_despacho, "procesar", documentos_hash
+                )
+                if cached:
+                    logger.info(f"Retornando procesamiento desde caché para {codigo_despacho}")
+                    docs_response = [
+                        DocumentoFinal(**doc) for doc in cached["resultado"]["documentos"]
+                    ]
+                    return ProcesamientoResponse(
+                        codigo_despacho=codigo_despacho,
+                        cliente=cached["cliente"],
+                        estado=cached["estado"],
+                        tipo=cached["tipo"],
+                        total_documentos_segmentados=cached["total_documentos_segmentados"],
+                        documentos=docs_response,
+                        cache_info=CacheInfo(
+                            desde_cache=True,
+                            hash_documentos=documentos_hash,
+                            fecha_cache=str(cached["updated_at"]),
+                            hay_cambios=False
+                        )
+                    )
+            
+            cache_info = CacheInfo(
+                desde_cache=False,
+                hash_documentos=documentos_hash,
+                hay_cambios=estado_cache.get("hay_cambios", True)
+            )
+        except Exception as e:
+            logger.warning(f"Error consultando caché: {e}")
+            cache_info = CacheInfo(desde_cache=False, hash_documentos=documentos_hash)
+
     todos_documentos_finales = []
     
     for doc in documentos_base64_list:
@@ -1462,7 +1601,6 @@ async def procesar_despacho(request: Request, codigo_despacho: str) -> Procesami
     
     docs_response = []
     for doc_final in todos_documentos_finales:
-        # Aplicamos limpieza a los datos extraídos si existen
         datos_limpios = None
         if doc_final.get("datos_extraidos"):
              datos_limpios = eliminar_campos_vacios(doc_final.get("datos_extraidos"))
@@ -1476,13 +1614,30 @@ async def procesar_despacho(request: Request, codigo_despacho: str) -> Procesami
             datos_extraidos=datos_limpios
         ))
 
+    # Guardar en caché
+    if settings.CACHE_ENABLED:
+        try:
+            await cache_repo.guardar_despacho(
+                codigo_despacho=codigo_despacho,
+                tipo_operacion="procesar",
+                documentos_hash=documentos_hash,
+                cliente=cliente_nombre,
+                estado=estado_despacho,
+                tipo=tipo_despacho,
+                total_documentos_segmentados=len(docs_response),
+                resultado={"documentos": [doc.model_dump() for doc in docs_response]}
+            )
+        except Exception as e:
+            logger.warning(f"Error guardando en caché: {e}")
+
     return ProcesamientoResponse(
         codigo_despacho=codigo_despacho,
         cliente=cliente_nombre,
         estado=estado_despacho,
         tipo=tipo_despacho,
         total_documentos_segmentados=len(docs_response),
-        documentos=docs_response
+        documentos=docs_response,
+        cache_info=cache_info
     )
 
 
@@ -1490,9 +1645,16 @@ async def procesar_despacho(request: Request, codigo_despacho: str) -> Procesami
 @post("/clasificar")
 async def clasificar_documento_individual(
     request: Request,
-    data: Annotated[UploadFile, Body(media_type=RequestEncodingType.MULTI_PART)]
+    data: Annotated[UploadFile, Body(media_type=RequestEncodingType.MULTI_PART)],
+    force: bool = False
 ) -> ProcesamientoIndividualResponse:
-    """Clasifica un documento individual."""
+    """
+    Clasifica un documento individual.
+    
+    Args:
+        data: Archivo a clasificar
+        force: Si es True, fuerza el reprocesamiento ignorando el caché
+    """
     verify_api_token(request)
     
     nombre_archivo = data.filename.lower()
@@ -1508,8 +1670,34 @@ async def clasificar_documento_individual(
 
     try:
         file_bytes = await data.read()
+        archivo_hash = calcular_hash_archivo(file_bytes)
 
         validar_tamano_archivo(file_bytes)
+
+        # Verificar caché
+        cache_info = None
+        if settings.CACHE_ENABLED and not force:
+            try:
+                cached = await cache_repo.obtener_documento(archivo_hash, "clasificar")
+                if cached:
+                    logger.info(f"Retornando clasificación desde caché para {data.filename}")
+                    docs_response = [
+                        DocumentoFinal(**doc) for doc in cached["resultado"]["documentos"]
+                    ]
+                    return ProcesamientoIndividualResponse(
+                        archivo_origen=data.filename,
+                        total_documentos_segmentados=cached["total_documentos_segmentados"],
+                        documentos=docs_response,
+                        cache_info=CacheInfo(
+                            desde_cache=True,
+                            hash_documentos=archivo_hash,
+                            fecha_cache=str(cached["updated_at"])
+                        )
+                    )
+                cache_info = CacheInfo(desde_cache=False, hash_documentos=archivo_hash)
+            except Exception as e:
+                logger.warning(f"Error consultando caché: {e}")
+                cache_info = CacheInfo(desde_cache=False, hash_documentos=archivo_hash)
 
         if es_excel:
             if not validar_excel(file_bytes, data.filename):
@@ -1545,7 +1733,6 @@ async def clasificar_documento_individual(
 
         docs_response = []
         for doc_final in resultado["documentos_finales"]:
-            # Aplicamos limpieza a los datos extraídos si existen
             datos_limpios = None
             if doc_final.get("datos_extraidos"):
                 datos_limpios = eliminar_campos_vacios(doc_final.get("datos_extraidos"))
@@ -1559,10 +1746,24 @@ async def clasificar_documento_individual(
                 datos_extraidos=datos_limpios
             ))
 
+        # Guardar en caché
+        if settings.CACHE_ENABLED:
+            try:
+                await cache_repo.guardar_documento(
+                    archivo_hash=archivo_hash,
+                    nombre_archivo=data.filename,
+                    tipo_operacion="clasificar",
+                    total_documentos_segmentados=len(docs_response),
+                    resultado={"documentos": [doc.model_dump() for doc in docs_response]}
+                )
+            except Exception as e:
+                logger.warning(f"Error guardando en caché: {e}")
+
         return ProcesamientoIndividualResponse(
             archivo_origen=data.filename,
             total_documentos_segmentados=len(docs_response),
-            documentos=docs_response
+            documentos=docs_response,
+            cache_info=cache_info
         )
     except HTTPException:
         raise
@@ -1573,9 +1774,16 @@ async def clasificar_documento_individual(
 @post("/procesar")
 async def procesar_documento_individual(
     request: Request,
-    data: Annotated[UploadFile, Body(media_type=RequestEncodingType.MULTI_PART)]
+    data: Annotated[UploadFile, Body(media_type=RequestEncodingType.MULTI_PART)],
+    force: bool = False
 ) -> ProcesamientoIndividualResponse:
-    """Procesa un documento individual completo."""
+    """
+    Procesa un documento individual completo.
+    
+    Args:
+        data: Archivo a procesar
+        force: Si es True, fuerza el reprocesamiento ignorando el caché
+    """
     verify_api_token(request)
     
     nombre_archivo = data.filename.lower()
@@ -1591,8 +1799,34 @@ async def procesar_documento_individual(
 
     try:
         file_bytes = await data.read()
+        archivo_hash = calcular_hash_archivo(file_bytes)
 
         validar_tamano_archivo(file_bytes)
+
+        # Verificar caché
+        cache_info = None
+        if settings.CACHE_ENABLED and not force:
+            try:
+                cached = await cache_repo.obtener_documento(archivo_hash, "procesar")
+                if cached:
+                    logger.info(f"Retornando procesamiento desde caché para {data.filename}")
+                    docs_response = [
+                        DocumentoFinal(**doc) for doc in cached["resultado"]["documentos"]
+                    ]
+                    return ProcesamientoIndividualResponse(
+                        archivo_origen=data.filename,
+                        total_documentos_segmentados=cached["total_documentos_segmentados"],
+                        documentos=docs_response,
+                        cache_info=CacheInfo(
+                            desde_cache=True,
+                            hash_documentos=archivo_hash,
+                            fecha_cache=str(cached["updated_at"])
+                        )
+                    )
+                cache_info = CacheInfo(desde_cache=False, hash_documentos=archivo_hash)
+            except Exception as e:
+                logger.warning(f"Error consultando caché: {e}")
+                cache_info = CacheInfo(desde_cache=False, hash_documentos=archivo_hash)
 
         if es_excel:
             if not validar_excel(file_bytes, data.filename):
@@ -1628,7 +1862,6 @@ async def procesar_documento_individual(
         
         docs_response = []
         for doc_final in resultado["documentos_finales"]:
-            # Aplicamos limpieza a los datos extraídos si existen
             datos_limpios = None
             if doc_final.get("datos_extraidos"):
                 datos_limpios = eliminar_campos_vacios(doc_final.get("datos_extraidos"))
@@ -1642,10 +1875,24 @@ async def procesar_documento_individual(
                 datos_extraidos=datos_limpios
             ))
 
+        # Guardar en caché
+        if settings.CACHE_ENABLED:
+            try:
+                await cache_repo.guardar_documento(
+                    archivo_hash=archivo_hash,
+                    nombre_archivo=data.filename,
+                    tipo_operacion="procesar",
+                    total_documentos_segmentados=len(docs_response),
+                    resultado={"documentos": [doc.model_dump() for doc in docs_response]}
+                )
+            except Exception as e:
+                logger.warning(f"Error guardando en caché: {e}")
+
         return ProcesamientoIndividualResponse(
             archivo_origen=data.filename,
             total_documentos_segmentados=len(docs_response),
-            documentos=docs_response
+            documentos=docs_response,
+            cache_info=cache_info
         )
     except HTTPException:
         raise
@@ -1653,7 +1900,7 @@ async def procesar_documento_individual(
         raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al procesar documento: {str(e)}")
 
 
-# Admin Routes
+# Admin Routes - Tokens
 @get("/")
 async def listar_tokens(request: Request) -> List[TokenInfo]:
     """Lista todos los tokens de la API con su metadata."""
@@ -1709,9 +1956,49 @@ async def eliminar_token(request: Request, token_id: str) -> TokenDeleteResponse
         )
 
 
+# Cache Management Routes
+@delete("/cache/despacho/{codigo_despacho:str}", status_code=HTTP_200_OK)
+async def eliminar_cache_despacho(
+    request: Request, 
+    codigo_despacho: str,
+    tipo_operacion: Optional[str] = None
+) -> dict:
+    """Elimina el caché de un despacho específico."""
+    verify_admin_token(request)
+    
+    try:
+        count = await cache_repo.eliminar_cache_despacho(codigo_despacho, tipo_operacion)
+        return {
+            "success": True,
+            "message": f"Eliminados {count} registros de caché",
+            "codigo_despacho": codigo_despacho
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error eliminando caché: {str(e)}"
+        )
+
+
 @get("/")
 async def root() -> dict:
-    return {"status": "online", "service": "API Docs", "azure_di": "cloud"}
+    return {"status": "online", "service": "API Docs", "azure_di": "cloud", "cache": "postgresql"}
+
+
+# Lifecycle events
+async def on_startup():
+    """Inicializa conexiones al iniciar la aplicación."""
+    try:
+        await db_manager.initialize()
+        logger.info("Base de datos inicializada correctamente")
+    except Exception as e:
+        logger.error(f"Error inicializando base de datos: {e}")
+
+
+async def on_shutdown():
+    """Cierra conexiones al detener la aplicación."""
+    await db_manager.close()
+    logger.info("Conexiones cerradas")
 
 
 # Crear Routers con prefijos y tags
@@ -1733,16 +2020,25 @@ admin_router = Router(
     tags=["Admin - Gestión de Tokens"]
 )
 
+cache_router = Router(
+    path="/admin",
+    route_handlers=[eliminar_cache_despacho],
+    tags=["Admin - Gestión de Caché"]
+)
+
 app = Litestar(
     route_handlers=[
         root,
         sgd_router,
         documentos_router,
         admin_router,
+        cache_router,
     ],
+    on_startup=[on_startup],
+    on_shutdown=[on_shutdown],
     openapi_config=OpenAPIConfig(
         title="API Docs",
-        version="2.0.0",
+        version="2.1.0",
         components=Components(
             security_schemes={
                 "BearerAuth": SecurityScheme(

@@ -2,8 +2,29 @@ services:
   sgd-api:
     build: .
     container_name: sgd-api
+    restart: unless-stopped
+    environment:
+      # Base de datos (apunta a pgbouncer de la red backend)
+      DB_HOST: pgbouncer
+      DB_PORT: 5432
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      # Cache
+      CACHE_ENABLED: ${CACHE_ENABLED:-true}
+      # Credenciales externas
+      BEARER_TOKEN: ${BEARER_TOKEN}
+      AZURE_ENDPOINT: ${AZURE_ENDPOINT}
+      AZURE_KEY: ${AZURE_KEY}
+      # API Auth
+      API_TOKENS: ${API_TOKENS:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      TZ: America/Santiago
     ports:
       - "8081:8001"
-    env_file:
-      - .env
-    restart: unless-stopped
+    networks:
+      - backend
+
+networks:
+  backend:
+    external: true

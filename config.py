@@ -13,6 +13,16 @@ class Settings(BaseSettings):
 
     # Admin Token - Token especial para gestionar el mantenedor de tokens
     ADMIN_TOKEN: str = ""  # Token de administrador para endpoints de gestión
+
+    # Database - PostgreSQL
+    DB_HOST: str = "pgbouncer"
+    DB_PORT: int = 5432
+    DB_USER: str = "admin"
+    DB_PASSWORD: str = ""
+    DB_NAME: str = "pruebas"
+
+    # Cache settings
+    CACHE_ENABLED: bool = True  # Habilitar/deshabilitar caché globalmente
     
     # HTTP Timeouts
     TIMEOUT_CONNECT: float = 5.0
